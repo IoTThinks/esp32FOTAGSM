@@ -3,4 +3,4 @@
 ## Purpose
 
 A simple library to add support for Over-The-Air (OTA) updates to your project via GSM.
-Original project only supports OTA via WiFi: https://github.com/chrisjoyce911/esp32FOTA
+* Original project only supports OTA via WiFi: https://github.com/chrisjoyce911/esp32FOTA
