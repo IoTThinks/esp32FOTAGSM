@@ -35,11 +35,11 @@ void setup()
 
 void loop()
 {
-  // bool updatedNeeded = esp32FOTA.execHTTPcheck();
-  // if (updatedNeeded)
-  // {
-  //  esp32FOTA.execOTA();
-  // }
+  bool updatedNeeded = esp32FOTAGSM.execHTTPcheck();
+  if (updatedNeeded)
+  {
+    esp32FOTAGSM.execOTA();
+  }
 
-  // delay(2000);
+  delay(2000);
 }
