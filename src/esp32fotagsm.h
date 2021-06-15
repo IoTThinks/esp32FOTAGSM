@@ -22,7 +22,10 @@ public:
   void execOTA();
   bool execHTTPcheck();
   bool useDeviceID;
-  String checkURL;
+  // String checkURL; 	// ArduinoHttpClient requires host, port and resource instead
+  String checkHOST; 	// example.com
+  int checkPORT;		// 80  
+  String checkRESOURCE; // /customer01/firmware.json
   void setModem(TinyGsm& modem);
 
 private:
@@ -32,10 +35,7 @@ private:
   String _host;
   String _bin;
   int _port;
-  
-  // https://github.com/blynkkk/blynk-library/blob/master/src/Adapters/BlynkGsmClient.h#L104
-  TinyGsm*     _modem;
-  // TinyGsmClient client;
+  TinyGsm*	_modem;
 };
 
 #endif

@@ -7,7 +7,8 @@
 #include "esp32fotagsm.h"
 #include "Arduino.h"
 // #include <WiFi.h>   // CHANGE
-#include <HTTPClient.h>
+// #include <HTTPClient.h>	// CHANGE
+#include <ArduinoHttpClient.h> // Kevin
 #include <Update.h>
 #include "ArduinoJson.h"
 
@@ -41,18 +42,28 @@ void esp32FOTAGSM::execOTA()
 	// CHANGE
 	// https://github.com/blynkkk/blynk-library/blob/master/src/Adapters/BlynkGsmClient.h#L99
 	// WiFiClient client;
-	// TinyGsmClient client(_modem); => not compilable
+	// TinyGsmClient client(_modem); => not able to compile
 	TinyGsmClient client;
-	client.init(_modem);
+	bool isClientOK = client.init(_modem);
+	// Serial.println("isClientOK: "+ String(isClientOK));
 	
     int contentLength = 0;
     bool isValidContentType = false;
     bool gotHTTPStatus = false;
 
     Serial.println("Connecting to: " + String(_host));
+	
+	// https://github.com/espressif/arduino-esp32/issues/325
+	// Written only : 0/564608. Retry?
+	// Error Occurred. Error #: 8
+	// client.setTimeout(5000); // Kevin, a bit longer wait
+	client.setTimeout(60000); // Kevin, muchlonger wait
+	
     // Connect to Webserver
     if (client.connect(_host.c_str(), _port))
     {
+		// client.setTimeout(60000); // Kevin, longer wait // REMOVED
+		
         // Connection Succeed.
         // Fetching the bin
         Serial.println("Fetching Bin: " + String(_bin));
@@ -66,7 +77,8 @@ void esp32FOTAGSM::execOTA()
         unsigned long timeout = millis();
         while (client.available() == 0)
         {
-            if (millis() - timeout > 5000)
+            // if (millis() - timeout > 5000) // CHANGE 
+			if (millis() - timeout > 60000) // Kevin: More timeout
             {
                 Serial.println("Client Timeout !");
                 client.stop();
@@ -209,11 +221,13 @@ bool esp32FOTAGSM::execHTTPcheck()
     if (useDeviceID)
     {
         // String deviceID = getDeviceID() ;
-        useURL = checkURL + "?id=" + getDeviceID();
+        // useURL = checkURL + "?id=" + getDeviceID();
+		useURL = checkRESOURCE + "?id=" + getDeviceID(); // Kevin
     }
     else
     {
-        useURL = checkURL;
+        // useURL = checkURL;
+		useURL = checkRESOURCE; // Kevin
     }
 
     _port = 80;
@@ -227,15 +241,41 @@ bool esp32FOTAGSM::execHTTPcheck()
 	if (_modem->isGprsConnected())
     { //Check the current connection status
 
-        HTTPClient http;		   // TO CHANGE: Dont know if works
+        // HTTPClient http;		   // TO CHANGE: Dont know if works
 
-        http.begin(useURL);        //Specify the URL
-        int httpCode = http.GET(); //Make the request
-
+        // http.begin(useURL);        //Specify the URL
+		// TinyGsmClient client((TinyGsm*)_modem);		// Kevin // Set o day bi bao loi. La thiet
+		TinyGsmClient client;
+		bool isClientOK = client.init(_modem);		// Kevin: return 1 => OK
+		// Serial.println("isClientOK: "+ String(isClientOK));
+		
+		// HttpClient    http(client, _host, _port); // Kevin
+		HttpClient    http(client, checkHOST, checkPORT); // Kevin
+        // int httpCode = http.GET(); //Make the request
+		// Serial.println("useURL: " + useURL);
+		// Serial.println("GPRS connected");
+				
+		int err = http.get(useURL);  // Kevin
+		// Serial.println("TinyGsmClient: " + String(client.connected()));
+		if (err != 0) {
+			Serial.println(F("failed to connect"));
+			delay(10000);
+			return false; // Error, nothing to update
+		}
+		else
+		{
+			// Hinh nhu cho nay ok
+			// Serial.println("http err:" + String(err));
+		}
+		
+		int httpCode = http.responseStatusCode();
+		// Serial.println("httpCode:" + String(httpCode));
+		
         if (httpCode == 200)
         { //Check is a file was returned
 
-            String payload = http.getString();
+            // String payload = http.getString(); // CHANGE 
+			String payload = http.responseBody();	// CHANGE
 
             int str_len = payload.length() + 1;
             char JSONMessage[str_len];
@@ -277,11 +317,14 @@ bool esp32FOTAGSM::execHTTPcheck()
 
         else
         {
-            Serial.println("Error on HTTP request");
+            // Serial.println("Error on HTTP request");
+			Serial.print("Error on HTTP request. Error code:");
+			Serial.println(httpCode);
             return false;
         }
 
-        http.end(); //Free the resources
+        // http.end(); //Free the resources
+		http.stop();   // Kevin
         return false;
     }
     return false;
@@ -310,4 +353,3 @@ void esp32FOTAGSM::setModem(TinyGsm& modem)
 {
 	_modem = &modem;
 }
-	

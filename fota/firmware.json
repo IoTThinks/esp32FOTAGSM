@@ -1,7 +1,7 @@
 {
-    "type": "esp32-fota-http",
+    "type": "test-esp32",
     "version": 2,
-    "host": "192.168.0.100",
+    "host": "example.com",
     "port": 80,
-    "bin": "/fota/esp32-fota-http-2.bin"
+    "bin": "/fota/fota_gprs_esp32.ino.esp32.bin"
 }
