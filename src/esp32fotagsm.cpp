@@ -128,15 +128,21 @@ void esp32FOTAGSM::execOTA()
         // check contentLength and content type
         if (contentLength && isValidContentType)
         {
+            // Setup Update onProgress callback
+            
+            Update.onProgress(
+                [](unsigned int progress, unsigned int total) {
+                    Serial.printf("Update Progress: %u of %u\r", progress, total);
+                }
+            );
+
             // Check if there is enough to OTA Update
             bool canBegin = Update.begin(contentLength);
 
             // If yes, begin
             if (canBegin)
             {
-                Serial.println("Begin OTA. This may take 2 - 5 mins to complete. Things might be quite for a while.. Patience!");
-                // No activity would appear on the Serial monitor
-                // So be patient. This may take 2 - 5mins to complete
+                Serial.println("Begin OTA. This may take several minutes to complete. Patience!");
                 size_t written = Update.writeStream(*_client);
 
                 if (written == contentLength)
@@ -204,14 +210,11 @@ bool esp32FOTAGSM::execHTTPcheck()
 
     if (useDeviceID)
     {
-        // String deviceID = getDeviceID() ;
-        // useURL = checkURL + "?id=" + getDeviceID();
-        useURL = checkRESOURCE + "?id=" + getDeviceID(); // Kevin
+        useURL = checkRESOURCE + "?id=" + getDeviceID();
     }
     else
     {
-        // useURL = checkURL;
-        useURL = checkRESOURCE; // Kevin
+        useURL = checkRESOURCE;
     }
 
     _port = 80;
@@ -221,7 +224,7 @@ bool esp32FOTAGSM::execHTTPcheck()
     Serial.println("------");
 
     //current connection status should be checked before calling this function
-    
+
     _client->setTimeout(60000); // Kevin, muchlonger wait
 
     if (_client->connect(checkHOST.c_str(), checkPORT))
@@ -296,29 +299,26 @@ bool esp32FOTAGSM::execHTTPcheck()
             {
                 String contentType = headerValue;
                 Serial.println("Got " + contentType + " payload.");
-                // if (contentType == "application/octet-stream")
-                // {
-                //     isValidContentType = true;
-                // }
-                isValidContentType = true;
+                if (contentType == "application/json")
+                {
+                    isValidContentType = true;
+                }
             }
         }
 
         // Check what is the contentLength and if content type is `application/octet-stream`
         Serial.println("contentLength : " + String(contentLength) + ", isValidContentType : " + String(isValidContentType));
 
+        // check if the contectLength is bigger than the buffer size
+        if (contentLength > 256)
+        {
+            Serial.println("contentLength is bigger than 256 bytes. Exiting Update check.");
+            return false;
+        }
+
         // check contentLength and content type
         if (contentLength && isValidContentType)
         {
-            // String payload;
-            // //@TODO String length should be limited
-
-            // payload = _client->readStringUntil('\n');
-            // Serial.println("Got payload : " + payload);
-
-            // int str_len = payload.length() + 1;
-            // char JSONMessage[str_len];
-            // payload.toCharArray(JSONMessage, str_len);
             char JSONMessage[256];
             _client->readBytes(JSONMessage, contentLength);
 
@@ -368,85 +368,9 @@ bool esp32FOTAGSM::execHTTPcheck()
     else
     {
         // Connect to webserver failed
-        // May be try?
-        // Probably a choppy network?
-        Serial.println("Connection to " + String(checkHOST) + " failed. Please check your setup");
-        // retry??
-        // execOTA();
+        Serial.println("Connection to " + String(checkHOST) + " failed.");
+        return false;
     }
-
-    // int err = http.get(useURL); // Kevin
-    // // Serial.println("TinyGsmClient: " + String(client.connected()));
-    // if (err != 0)
-    // {
-    //     Serial.println(F("failed to connect"));
-    //     delay(10000);
-    //     return false; // Error, nothing to update
-    // }
-    // else
-    // {
-    //     // Hinh nhu cho nay ok
-    //     // Serial.println("http err:" + String(err));
-    // }
-
-    // int httpCode = http.responseStatusCode();
-    // // Serial.println("httpCode:" + String(httpCode));
-
-    // if (httpCode == 200)
-    // { //Check is a file was returned
-
-    //     // String payload = http.getString(); // CHANGE
-    //     String payload = http.responseBody(); // CHANGE
-
-    //     int str_len = payload.length() + 1;
-    //     char JSONMessage[str_len];
-    //     payload.toCharArray(JSONMessage, str_len);
-
-    //     StaticJsonDocument<300> JSONDocument; //Memory pool
-    //     DeserializationError err = deserializeJson(JSONDocument, JSONMessage);
-
-    //     if (err)
-    //     { //Check for errors in parsing
-    //         Serial.println("Parsing failed");
-    //         delay(5000);
-    //         return false;
-    //     }
-
-    //     const char *pltype = JSONDocument["type"];
-    //     int plversion = JSONDocument["version"];
-    //     const char *plhost = JSONDocument["host"];
-    //     _port = JSONDocument["port"];
-    //     const char *plbin = JSONDocument["bin"];
-
-    //     String jshost(plhost);
-    //     String jsbin(plbin);
-
-    //     _host = jshost;
-    //     _bin = jsbin;
-
-    //     String fwtype(pltype);
-
-    //     if (plversion > _firwmareVersion && fwtype == _firwmareType)
-    //     {
-    //         return true;
-    //     }
-    //     else
-    //     {
-    //         return false;
-    //     }
-    // }
-
-    // else
-    // {
-    //     // Serial.println("Error on HTTP request");
-    //     Serial.print("Error on HTTP request. Error code:");
-    //     Serial.println(httpCode);
-    //     return false;
-    // }
-
-    // // http.end(); //Free the resources
-    // http.stop(); // Kevin
-    // return false;
 }
 
 String esp32FOTAGSM::getDeviceID()
