@@ -137,7 +137,7 @@ void esp32FOTAGSM::execOTA()
                 Serial.println("Begin OTA. This may take 2 - 5 mins to complete. Things might be quite for a while.. Patience!");
                 // No activity would appear on the Serial monitor
                 // So be patient. This may take 2 - 5mins to complete
-                size_t written = Update.writeStream(_client);
+                size_t written = Update.writeStream(*_client);
 
                 if (written == contentLength)
                 {
@@ -244,7 +244,7 @@ bool esp32FOTAGSM::execHTTPcheck()
             {
                 Serial.println("Client Timeout !");
                 _client->stop();
-                return;
+                return false;
             }
         }
 
@@ -310,14 +310,17 @@ bool esp32FOTAGSM::execHTTPcheck()
         // check contentLength and content type
         if (contentLength && isValidContentType)
         {
-            String payload;
-            //@TODO String length should be limited
-            payload = _client->readStringUntil('\n');
-            Serial.println("Got payload : " + payload);
+            // String payload;
+            // //@TODO String length should be limited
 
-            int str_len = payload.length() + 1;
-            char JSONMessage[str_len];
-            payload.toCharArray(JSONMessage, str_len);
+            // payload = _client->readStringUntil('\n');
+            // Serial.println("Got payload : " + payload);
+
+            // int str_len = payload.length() + 1;
+            // char JSONMessage[str_len];
+            // payload.toCharArray(JSONMessage, str_len);
+            char JSONMessage[256];
+            _client->readBytes(JSONMessage, contentLength);
 
             StaticJsonDocument<300> JSONDocument; //Memory pool
             DeserializationError err = deserializeJson(JSONDocument, JSONMessage);
@@ -342,6 +345,10 @@ bool esp32FOTAGSM::execHTTPcheck()
             _bin = jsbin;
 
             String fwtype(pltype);
+
+            Serial.println(plhost);
+            Serial.println(plbin);
+            Serial.println(fwtype);
 
             if (plversion > _firwmareVersion && fwtype == _firwmareType)
             {
