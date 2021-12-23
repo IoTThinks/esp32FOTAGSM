@@ -10,6 +10,9 @@
 #include "ArduinoJson.h"
 #include "esp_log.h"
 
+#define CLIENT_TIMEOUT_MS (60000)
+#define DOWNLOAD_CHUNK_SIZE (4096)
+
 esp32FOTAGSM::esp32FOTAGSM(Client &client, String firwmareType, int firwmareVersion)
 {
     this->setClient(client);
@@ -31,40 +34,42 @@ static void splitHeader(String src, String &header, String &headerValue)
 }
 
 // OTA Logic
-void esp32FOTAGSM::execOTA()
+bool esp32FOTAGSM::execOTA()
 {
-
+    unsigned long timeout = 0;
     int contentLength = 0;
     bool isValidContentType = false;
+    bool Accept_Ranges_bytes = false;
     bool gotHTTPStatus = false;
 
-    ESP_LOGD(TAG, "Connecting to: ", _host.c_str());
+    size_t written = 0;
 
-    _client->setTimeout(60000); // Kevin, muchlonger wait
+    ESP_LOGD(TAG, "Connecting to: %S", _host.c_str());
+
+    _client->setTimeout(CLIENT_TIMEOUT_MS);
 
     // Connect to Webserver
     if (_client->connect(_host.c_str(), _port))
     {
 
         // Connection Succeed.
-        // Fetching the bin
-        Serial.println("Fetching Bin: " + String(_bin));
+        // Fetching the bin HEAD
+        Serial.println("Fetching Bin HEAD: " + String(_bin));
 
         // Get the contents of the bin file
-        _client->print(String("GET ") + _bin + " HTTP/1.1\r\n" +
+        _client->print(String("HEAD ") + _bin + " HTTP/1.1\r\n" +
                        "Host: " + _host + "\r\n" +
                        "Cache-Control: no-cache\r\n" +
                        "Connection: close\r\n\r\n");
 
-        unsigned long timeout = millis();
+        timeout = millis();
         while (_client->available() == 0)
         {
-            // if (millis() - timeout > 5000) // CHANGE
-            if (millis() - timeout > 60000) // Kevin: More timeout
+            if (millis() - timeout > CLIENT_TIMEOUT_MS)
             {
-                Serial.println("Client Timeout !");
+                ESP_LOGD(TAG, "Client Timeout !");
                 _client->stop();
-                return;
+                return false;
             }
         }
 
@@ -73,6 +78,9 @@ void esp32FOTAGSM::execOTA()
             String header, headerValue;
             // read line till /n
             String line = _client->readStringUntil('\n');
+
+            ESP_LOGD(TAG, "Header line: %s", line.c_str());
+
             // remove space, to check if the line is end of headers
             line.trim();
 
@@ -88,7 +96,7 @@ void esp32FOTAGSM::execOTA()
             {
                 if (line.indexOf("200") < 0)
                 {
-                    Serial.println("Got a non 200 status code from server. Exiting OTA Update.");
+                    ESP_LOGE(TAG, "Got a non 200 status code from server. Exiting OTA Update.");
                     _client->stop();
                     break;
                 }
@@ -103,100 +111,257 @@ void esp32FOTAGSM::execOTA()
             splitHeader(line, header, headerValue);
 
             // extract headers here
-            // Start with content length
+            // Content-Length
             if (header.equalsIgnoreCase("Content-Length"))
             {
                 contentLength = headerValue.toInt();
-                Serial.println("Got " + String(contentLength) + " bytes from server");
-                continue;
+                Serial.println("Content-Length: " + String(contentLength));
             }
-
-            // Next, the content type
-            if (header.equalsIgnoreCase("Content-type"))
+            // Content-type
+            else if (header.equalsIgnoreCase("Content-type"))
             {
                 String contentType = headerValue;
                 Serial.println("Got " + contentType + " payload.");
                 if (contentType == "application/octet-stream")
                 {
+                    Serial.println("Content-Length: " + String(contentLength));
                     isValidContentType = true;
                 }
             }
-        }
-        // Check what is the contentLength and if content type is `application/octet-stream`
-        Serial.println("contentLength : " + String(contentLength) + ", isValidContentType : " + String(isValidContentType));
-
-        // check contentLength and content type
-        if (contentLength && isValidContentType)
-        {
-            // Setup Update onProgress callback
-            
-            Update.onProgress(
-                [](unsigned int progress, unsigned int total) {
-                    Serial.printf("Update Progress: %u of %u\r", progress, total);
-                }
-            );
-
-            // Check if there is enough to OTA Update
-            bool canBegin = Update.begin(contentLength);
-
-            // If yes, begin
-            if (canBegin)
+            // Accept-Ranges
+            else if (header.equalsIgnoreCase("Accept-Ranges"))
             {
-                Serial.println("Begin OTA. This may take several minutes to complete. Patience!");
-                size_t written = Update.writeStream(*_client);
-
-                if (written == contentLength)
+                String contentType = headerValue;
+                Serial.println("Got " + contentType + " payload.");
+                if (contentType == "bytes")
                 {
-                    Serial.println("Written : " + String(written) + " successfully");
-                }
-                else
-                {
-                    Serial.println("Written only : " + String(written) + "/" + String(contentLength) + ". Retry?");
-                    // retry??
-                    // execOTA();
-                }
-
-                if (Update.end())
-                {
-                    Serial.println("OTA done!");
-                    if (Update.isFinished())
-                    {
-                        Serial.println("Update successfully completed. Rebooting.");
-                        ESP.restart();
-                    }
-                    else
-                    {
-                        Serial.println("Update not finished? Something went wrong!");
-                    }
-                }
-                else
-                {
-                    Serial.println("Error Occurred. Error #: " + String(Update.getError()));
+                    Serial.println("Server supports range requests");
+                    Accept_Ranges_bytes = true;
                 }
             }
-            else
-            {
-                // not enough space to begin OTA
-                // Understand the partitions and
-                // space availability
-                Serial.println("Not enough space to begin OTA");
-                _client->flush();
-            }
-        }
-        else
-        {
-            Serial.println("There was no content in the response");
-            _client->flush();
         }
     }
     else
     {
-        // Connect to webserver failed
-        // May be try?
-        // Probably a choppy network?
-        Serial.println("Connection to " + String(_host) + " failed. Please check your setup");
-        // retry??
-        // execOTA();
+        Serial.println("Connection to " + String(_host) + " failed!");
+        return false;
+    }
+
+    // We will open a new connection to the server later
+    _client->stop();
+
+    // check contentLength and content type
+    if (contentLength && isValidContentType)
+    {
+
+        // Check if there is enough to OTA Update.
+        if (Update.begin(contentLength))
+        {
+            ESP_LOGD(TAG, "OTA file can be downloaded.");
+
+            // Setup Update onProgress callback
+            Update.onProgress(
+                [](unsigned int progress, unsigned int total)
+                {
+                    ESP_LOGI(TAG, "Update Progress: %u of %u", progress, total);
+                });
+
+            if (Accept_Ranges_bytes)
+            {
+                Serial.println("OTA file will be downloaded in chunks");
+
+                // Number of chunks
+                int numChunks = contentLength / DOWNLOAD_CHUNK_SIZE;
+                if (contentLength % DOWNLOAD_CHUNK_SIZE)
+                {
+                    numChunks++;
+                }
+
+                uint chunk_first_byte = 0;
+                uint chunk_last_byte = DOWNLOAD_CHUNK_SIZE - 1;
+                uint remainig_bytes = contentLength;
+                uint8_t chunk_buffer[DOWNLOAD_CHUNK_SIZE];
+
+                while (remainig_bytes > 0)
+                {
+                    if(!_client->connected()){
+                        ESP_LOGE(TAG, "Client Disconnected");
+                        
+                        // Connect to Webserver
+                        if (_client->connect(_host.c_str(), _port))
+                        {
+                            ESP_LOGD(TAG, "client connected");
+                        }
+                        else
+                        {
+                            Serial.println("Connection to " + String(_host) + " failed! Retrying in 5 seconds");
+                            delay(5000);
+                            continue;
+                        }
+                    }
+                    else{
+                        ESP_LOGD(TAG, "Client Connected");
+                        ESP_LOGD(TAG, "Downloading chunk from %u to %u, remaining bytes: %u", chunk_first_byte, chunk_last_byte, remainig_bytes);
+
+                        if(remainig_bytes < DOWNLOAD_CHUNK_SIZE){
+                            chunk_last_byte = chunk_first_byte + remainig_bytes - 1;
+                        }
+
+                        _client->flush();
+                        // Get the contents of the bin file
+                        _client->print(String("GET ") + _bin + " HTTP/1.1\r\n" +
+                                    "Host: " + _host + "\r\n" +
+                                    "Cache-Control: no-cache\r\n" +
+                                    "Range: bytes=" + String(chunk_first_byte) + "-" + String(chunk_last_byte) + "\r\n" +
+                                    "Connection: keep-alive\r\n\r\n");
+
+                        timeout = millis();
+                        while (_client->available() == 0)
+                        {
+                            if (millis() - timeout > CLIENT_TIMEOUT_MS)
+                            {
+                                ESP_LOGD(TAG, "Client Timeout !");
+                                _client->stop();
+                                return false;
+                            }
+                        }
+
+                        // Read the headers
+                        while (_client->available())
+                        {
+                            String header, headerValue;
+                            // read line till /n
+                            String line = _client->readStringUntil('\n');
+
+                            ESP_LOGV(TAG, "Header line: %s", line.c_str());
+
+                            // remove space, to check if the line is end of headers
+                            line.trim();
+
+                            if (!line.length())
+                            {
+                                ESP_LOGV(TAG, "Headers ended. Get the payload");
+                                break;
+                            }
+                        }
+
+                        // Read the payload
+                        size_t readed_bytes = _client->readBytes(chunk_buffer, chunk_last_byte - chunk_first_byte + 1);
+                        ESP_LOGD(TAG, "Readed %u bytes from payload", readed_bytes);
+
+                        // Write chunk to flash
+                        written += Update.write(chunk_buffer, readed_bytes);
+                        ESP_LOGD(TAG, "Written %u bytes to flash", written);
+
+                        remainig_bytes -= readed_bytes;
+
+                        /*
+                        @TODO check if written == readed_bytes. If not, we should retry the chunk download, 
+                        adjusting the chunk_last_byte and chunk_first_byte acordingly.
+                        */
+                        // Increment chunk
+                        chunk_first_byte += DOWNLOAD_CHUNK_SIZE;
+                        chunk_last_byte += DOWNLOAD_CHUNK_SIZE;
+                    }
+                }
+            }
+            else
+            {
+                Serial.println("OTA file will be downloaded in one go");
+                _client->flush();
+
+                // Connect to Webserver
+                if (_client->connect(_host.c_str(), _port))
+                {
+                    // Get the contents of the bin file
+                    _client->print(String("GET ") + _bin + " HTTP/1.1\r\n" +
+                                "Host: " + _host + "\r\n" +
+                                "Cache-Control: no-cache\r\n" +
+                                "Connection: close\r\n\r\n");
+
+                    timeout = millis();
+                    while (_client->available() == 0)
+                    {
+                        if (millis() - timeout > CLIENT_TIMEOUT_MS)
+                        {
+                            ESP_LOGD(TAG, "Client Timeout !");
+                            _client->stop();
+                            return false;
+                        }
+                    }
+                    while (_client->available())
+                    {
+                        String header, headerValue;
+                        // read line till /n
+                        String line = _client->readStringUntil('\n');
+
+                        ESP_LOGD(TAG, "Header line: %s", line.c_str());
+
+                        // remove space, to check if the line is end of headers
+                        line.trim();
+
+                        if (!line.length())
+                        {
+                            ESP_LOGD(TAG, "Headers ended. Get the OTA started");
+                            break;
+                        }
+                    }
+
+                    ESP_LOGD(TAG, "Begin OTA. This may take several minutes to complete. Patience!");
+                    written = Update.writeStream(*_client);
+                }
+                else
+                {
+                    Serial.println("Connection to " + String(_host) + " failed!");
+                    return false;
+                }
+                
+            }
+
+            if (written == contentLength)
+            {
+                Serial.println("Written : " + String(written) + " successfully");
+            }
+            else
+            {
+                Serial.println("Written only : " + String(written) + " of " + String(contentLength) + " OTA will not proceed. ");
+            }
+
+            if (Update.end())
+            {
+                Serial.println("OTA done!");
+                if (Update.isFinished())
+                {
+                    Serial.println("Update successfully completed. Rebooting.");
+                    ESP.restart();
+                }
+                else
+                {
+                    Serial.println("Update not finished? Something went wrong!");
+                }
+            }
+            else
+            {
+                Serial.println("Error Occurred. Error #: " + String(Update.getError()) + String(Update.errorString()));
+            }
+        }
+        else
+        {
+            // not enough space to begin OTA
+            // Understand the partitions and
+            // space availability
+            ESP_LOGE(TAG, "Not enough space to begin OTA");
+            _client->flush();
+
+            return false;
+        }
+    }
+    else
+    {
+        ESP_LOGE(TAG, "There was no content in the response or the content type was not application/octet-stream");
+        _client->flush();
+
+        return false;
     }
 }
 
@@ -225,7 +390,7 @@ bool esp32FOTAGSM::execHTTPcheck()
 
     //current connection status should be checked before calling this function
 
-    _client->setTimeout(60000); // Kevin, muchlonger wait
+    _client->setTimeout(CLIENT_TIMEOUT_MS);
 
     if (_client->connect(checkHOST.c_str(), checkPORT))
     {
@@ -242,10 +407,9 @@ bool esp32FOTAGSM::execHTTPcheck()
         unsigned long timeout = millis();
         while (_client->available() == 0)
         {
-            // if (millis() - timeout > 5000) // CHANGE
-            if (millis() - timeout > 60000) // Kevin: More timeout
+            if (millis() - timeout > CLIENT_TIMEOUT_MS)
             {
-                Serial.println("Client Timeout !");
+                ESP_LOGD(TAG, "Client Timeout !");
                 _client->stop();
                 return false;
             }
@@ -256,6 +420,9 @@ bool esp32FOTAGSM::execHTTPcheck()
             String header, headerValue;
             // read line till /n
             String line = _client->readStringUntil('\n');
+
+            ESP_LOGD(TAG, "Header line: %s", line.c_str());
+
             // remove space, to check if the line is end of headers
             line.trim();
 
