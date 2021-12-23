@@ -54,7 +54,7 @@ bool esp32FOTAGSM::execOTA()
 
         // Connection Succeed.
         // Fetching the bin HEAD
-        Serial.println("Fetching Bin HEAD: " + String(_bin));
+        ESP_LOGD(TAG, "Fetching Bin HEAD: %s", _bin.c_str());
 
         // Get the contents of the bin file
         _client->print(String("HEAD ") + _bin + " HTTP/1.1\r\n" +
@@ -115,16 +115,16 @@ bool esp32FOTAGSM::execOTA()
             if (header.equalsIgnoreCase("Content-Length"))
             {
                 contentLength = headerValue.toInt();
-                Serial.println("Content-Length: " + String(contentLength));
+                ESP_LOGD(TAG, "Content-Length: %d", contentLength);
             }
             // Content-type
             else if (header.equalsIgnoreCase("Content-type"))
             {
                 String contentType = headerValue;
-                Serial.println("Got " + contentType + " payload.");
+                ESP_LOGD(TAG, "Content-type: %s", contentType.c_str());
                 if (contentType == "application/octet-stream")
                 {
-                    Serial.println("Content-Length: " + String(contentLength));
+                    ESP_LOGD(TAG, "Valid Content-type");
                     isValidContentType = true;
                 }
             }
@@ -132,10 +132,10 @@ bool esp32FOTAGSM::execOTA()
             else if (header.equalsIgnoreCase("Accept-Ranges"))
             {
                 String contentType = headerValue;
-                Serial.println("Got " + contentType + " payload.");
+                ESP_LOGD(TAG, "Accept-Ranges: %s", contentType.c_str());
                 if (contentType == "bytes")
                 {
-                    Serial.println("Server supports range requests");
+                    ESP_LOGD(TAG, "Server supports range requests");
                     Accept_Ranges_bytes = true;
                 }
             }
@@ -143,7 +143,7 @@ bool esp32FOTAGSM::execOTA()
     }
     else
     {
-        Serial.println("Connection to " + String(_host) + " failed!");
+        ESP_LOGD(TAG, "Connection to %s failed!", _host.c_str());
         return false;
     }
 
@@ -168,7 +168,7 @@ bool esp32FOTAGSM::execOTA()
 
             if (Accept_Ranges_bytes)
             {
-                Serial.println("OTA file will be downloaded in chunks");
+                ESP_LOGD(TAG, "OTA file will be downloaded in chunks");
 
                 // Number of chunks
                 int numChunks = contentLength / DOWNLOAD_CHUNK_SIZE;
@@ -181,6 +181,7 @@ bool esp32FOTAGSM::execOTA()
                 uint chunk_last_byte = DOWNLOAD_CHUNK_SIZE - 1;
                 uint remainig_bytes = contentLength;
                 uint8_t chunk_buffer[DOWNLOAD_CHUNK_SIZE];
+                bool should_close_connection = false;
 
                 while (remainig_bytes > 0)
                 {
@@ -194,14 +195,14 @@ bool esp32FOTAGSM::execOTA()
                         }
                         else
                         {
-                            Serial.println("Connection to " + String(_host) + " failed! Retrying in 5 seconds");
+                            ESP_LOGD(TAG, "Connection to %s failed! Retrying in 5 seconds", _host.c_str());
                             delay(5000);
                             continue;
                         }
                     }
                     else{
                         ESP_LOGD(TAG, "Client Connected");
-                        ESP_LOGD(TAG, "Downloading chunk from %u to %u, remaining bytes: %u", chunk_first_byte, chunk_last_byte, remainig_bytes);
+                        ESP_LOGD(TAG, "Downloading a chunk from bytes %u to %u, remaining bytes: %u", chunk_first_byte, chunk_last_byte, remainig_bytes);
 
                         if(remainig_bytes < DOWNLOAD_CHUNK_SIZE){
                             chunk_last_byte = chunk_first_byte + remainig_bytes - 1;
@@ -233,7 +234,7 @@ bool esp32FOTAGSM::execOTA()
                             // read line till /n
                             String line = _client->readStringUntil('\n');
 
-                            ESP_LOGV(TAG, "Header line: %s", line.c_str());
+                            // ESP_LOGV(TAG, "Header line: %s", line.c_str());
 
                             // remove space, to check if the line is end of headers
                             line.trim();
@@ -243,6 +244,41 @@ bool esp32FOTAGSM::execOTA()
                                 ESP_LOGV(TAG, "Headers ended. Get the payload");
                                 break;
                             }
+                            // Check if the HTTP Response is 206
+                            // else break and Exit Update
+                            if (line.startsWith("HTTP/1.1"))
+                            {
+                                if (line.indexOf("206") < 0)
+                                {
+                                    ESP_LOGE(TAG, "Got a non 206 status code from server. Exiting OTA Update.");
+                                    // @TODO: check exit code
+                                    _client->stop();
+                                    break;
+                                }
+                            }
+
+                            splitHeader(line, header, headerValue);
+
+                            // extract headers here
+                            // Connection
+                            if (header.equalsIgnoreCase("Connection"))
+                            {
+                                if (headerValue == "keep-alive")
+                                {
+                                    ESP_LOGD(TAG, "Server will keep the connection alive");
+                                    should_close_connection = false;
+                                }else{
+                                    ESP_LOGD(TAG, "Server will close the connection");
+                                    should_close_connection = true;
+                                }
+                            }
+                            // Content-Range
+                            else if (header.equalsIgnoreCase("Content-Range"))
+                            {
+                                ESP_LOGD(TAG, "Content-Range: %s", headerValue.c_str());
+                                // @TODO: check if the content range is valid
+                            }
+
                         }
 
                         // Read the payload
@@ -262,12 +298,18 @@ bool esp32FOTAGSM::execOTA()
                         // Increment chunk
                         chunk_first_byte += DOWNLOAD_CHUNK_SIZE;
                         chunk_last_byte += DOWNLOAD_CHUNK_SIZE;
+
+                        if(should_close_connection){
+                            ESP_LOGD(TAG, "Server will close the connection, so we will close the client");
+                            _client->stop();
+                            delay(1000);
+                        }
                     }
                 }
             }
             else
             {
-                Serial.println("OTA file will be downloaded in one go");
+                ESP_LOGD(TAG, "OTA file will be downloaded in one go");
                 _client->flush();
 
                 // Connect to Webserver
@@ -312,7 +354,7 @@ bool esp32FOTAGSM::execOTA()
                 }
                 else
                 {
-                    Serial.println("Connection to " + String(_host) + " failed!");
+                    ESP_LOGD(TAG, "Connection to %s failed!", _host.c_str());
                     return false;
                 }
                 
@@ -320,29 +362,29 @@ bool esp32FOTAGSM::execOTA()
 
             if (written == contentLength)
             {
-                Serial.println("Written : " + String(written) + " successfully");
+                ESP_LOGD(TAG, "Written: %d successfully", written);
             }
             else
             {
-                Serial.println("Written only : " + String(written) + " of " + String(contentLength) + " OTA will not proceed. ");
+                ESP_LOGD(TAG, "Written only : %d of %d. OTA will not proceed. ", written, contentLength);
             }
 
             if (Update.end())
             {
-                Serial.println("OTA done!");
+                ESP_LOGD(TAG, "OTA done!");
                 if (Update.isFinished())
                 {
-                    Serial.println("Update successfully completed. Rebooting.");
+                    ESP_LOGD(TAG, "Update successfully completed. Rebooting.");
                     ESP.restart();
                 }
                 else
                 {
-                    Serial.println("Update not finished? Something went wrong!");
+                    ESP_LOGD(TAG, "Update not finished? Something went wrong!");
                 }
             }
             else
             {
-                Serial.println("Error Occurred. Error #: " + String(Update.getError()) + String(Update.errorString()));
+                ESP_LOGD(TAG, "Error Occurred. Error #%d: %s", Update.getError(), Update.errorString());
             }
         }
         else
@@ -384,9 +426,7 @@ bool esp32FOTAGSM::execHTTPcheck()
 
     _port = 80;
 
-    Serial.println("Getting HTTP");
-    Serial.println(useURL);
-    Serial.println("------");
+    ESP_LOGD(TAG, "Getting %s", useURL.c_str());
 
     //current connection status should be checked before calling this function
 
@@ -395,8 +435,6 @@ bool esp32FOTAGSM::execHTTPcheck()
     if (_client->connect(checkHOST.c_str(), checkPORT))
     {
         // Connection Succeed.
-        // Fetching the bin
-        Serial.println("Fetching JSON:" + useURL);
 
         // Get the contents of the bin file
         _client->print(String("GET ") + checkRESOURCE + " HTTP/1.1\r\n" +
@@ -438,7 +476,7 @@ bool esp32FOTAGSM::execHTTPcheck()
             {
                 if (line.indexOf("200") < 0)
                 {
-                    Serial.println("Got a non 200 status code from server. Exiting OTA Update.");
+                    ESP_LOGD(TAG, "Got a non 200 status code from server. Exiting OTA Update.");
                     _client->stop();
                     break;
                 }
@@ -457,7 +495,7 @@ bool esp32FOTAGSM::execHTTPcheck()
             if (header.equalsIgnoreCase("Content-Length"))
             {
                 contentLength = headerValue.toInt();
-                Serial.println("Got " + String(contentLength) + " bytes from server");
+                ESP_LOGD(TAG, "Content-Length: %d", contentLength);
                 continue;
             }
 
@@ -465,21 +503,19 @@ bool esp32FOTAGSM::execHTTPcheck()
             if (header.equalsIgnoreCase("Content-type"))
             {
                 String contentType = headerValue;
-                Serial.println("Got " + contentType + " payload.");
+                ESP_LOGD(TAG, "Content-type: %s", contentType.c_str());
                 if (contentType == "application/json")
                 {
+                    ESP_LOGD(TAG, "Valid Content-type");
                     isValidContentType = true;
                 }
             }
         }
 
-        // Check what is the contentLength and if content type is `application/octet-stream`
-        Serial.println("contentLength : " + String(contentLength) + ", isValidContentType : " + String(isValidContentType));
-
         // check if the contectLength is bigger than the buffer size
         if (contentLength > 256)
         {
-            Serial.println("contentLength is bigger than 256 bytes. Exiting Update check.");
+            ESP_LOGD(TAG, "contentLength is bigger than 256 bytes. Exiting Update check.");
             return false;
         }
 
@@ -494,7 +530,7 @@ bool esp32FOTAGSM::execHTTPcheck()
 
             if (err)
             { //Check for errors in parsing
-                Serial.println("Parsing failed");
+                ESP_LOGD(TAG, "Parsing failed");
                 delay(5000);
                 return false;
             }
@@ -507,15 +543,14 @@ bool esp32FOTAGSM::execHTTPcheck()
 
             String jshost(plhost);
             String jsbin(plbin);
+            String fwtype(pltype);
 
             _host = jshost;
             _bin = jsbin;
 
-            String fwtype(pltype);
-
-            Serial.println(plhost);
-            Serial.println(plbin);
-            Serial.println(fwtype);
+            ESP_LOGD(TAG, "Host: %s", plhost);
+            ESP_LOGD(TAG, "bin: %s", plbin);
+            ESP_LOGD(TAG, "type %s", pltype);
 
             if (plversion > _firwmareVersion && fwtype == _firwmareType)
             {
@@ -528,14 +563,14 @@ bool esp32FOTAGSM::execHTTPcheck()
         }
         else
         {
-            Serial.println("There was no content in the response");
+            ESP_LOGD(TAG, "There was no content in the response");
             _client->flush();
         }
     }
     else
     {
         // Connect to webserver failed
-        Serial.println("Connection to " + String(checkHOST) + " failed.");
+        ESP_LOGD(TAG, "Connection to %s failed.", checkHOST.c_str());
         return false;
     }
 }
