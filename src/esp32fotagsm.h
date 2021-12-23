@@ -9,15 +9,10 @@
 
 #include "Arduino.h"
 
-#if (!defined(SRC_TINYGSMCLIENT_H_))
-#define TINY_GSM_MODEM_SIM800
-#include <TinyGsmClient.h>
-#endif  // SRC_TINYGSMCLIENT_H_
-
 class esp32FOTAGSM
 {
 public:
-  esp32FOTAGSM(String firwmareType, int firwmareVersion);
+  esp32FOTAGSM(Client& client, String firwmareType, int firwmareVersion);
   void forceUpdate(String firwmareHost, int firwmarePort, String firwmarePath);
   void execOTA();
   bool execHTTPcheck();
@@ -26,7 +21,7 @@ public:
   String checkHOST; 	// example.com
   int checkPORT;		// 80  
   String checkRESOURCE; // /customer01/firmware.json
-  void setModem(TinyGsm& modem);
+  void setClient(Client& client);
 
 private:
   String getDeviceID();
@@ -35,7 +30,7 @@ private:
   String _host;
   String _bin;
   int _port;
-  TinyGsm*	_modem;
+  Client* _client;
 };
 
 #endif

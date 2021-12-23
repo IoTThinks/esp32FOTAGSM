@@ -6,19 +6,13 @@
 
 #include "esp32fotagsm.h"
 #include "Arduino.h"
-// #include <WiFi.h>   // CHANGE
-// #include <HTTPClient.h>	// CHANGE
-#include <ArduinoHttpClient.h> // Kevin
 #include <Update.h>
 #include "ArduinoJson.h"
+#include "esp_log.h"
 
-#if (!defined(SRC_TINYGSMCLIENT_H_))
-#define TINY_GSM_MODEM_SIM800
-#include <TinyGsmClient.h>
-#endif  // SRC_TINYGSMCLIENT_H_
-
-esp32FOTAGSM::esp32FOTAGSM(String firwmareType, int firwmareVersion)
+esp32FOTAGSM::esp32FOTAGSM(Client &client, String firwmareType, int firwmareVersion)
 {
+    this->setClient(client);
     _firwmareType = firwmareType;
     _firwmareVersion = firwmareVersion;
     useDeviceID = false;
@@ -39,58 +33,46 @@ static void splitHeader(String src, String &header, String &headerValue)
 // OTA Logic
 void esp32FOTAGSM::execOTA()
 {
-	// CHANGE
-	// https://github.com/blynkkk/blynk-library/blob/master/src/Adapters/BlynkGsmClient.h#L99
-	// WiFiClient client;
-	// TinyGsmClient client(_modem); => not able to compile
-	TinyGsmClient client;
-	bool isClientOK = client.init(_modem);
-	// Serial.println("isClientOK: "+ String(isClientOK));
-	
+
     int contentLength = 0;
     bool isValidContentType = false;
     bool gotHTTPStatus = false;
 
-    Serial.println("Connecting to: " + String(_host));
-	
-	// https://github.com/espressif/arduino-esp32/issues/325
-	// Written only : 0/564608. Retry?
-	// Error Occurred. Error #: 8
-	// client.setTimeout(5000); // Kevin, a bit longer wait
-	client.setTimeout(60000); // Kevin, muchlonger wait
-	
+    ESP_LOGD(TAG, "Connecting to: ", _host.c_str());
+
+    _client->setTimeout(60000); // Kevin, muchlonger wait
+
     // Connect to Webserver
-    if (client.connect(_host.c_str(), _port))
+    if (_client->connect(_host.c_str(), _port))
     {
-		// client.setTimeout(60000); // Kevin, longer wait // REMOVED
-		
+
         // Connection Succeed.
         // Fetching the bin
         Serial.println("Fetching Bin: " + String(_bin));
 
         // Get the contents of the bin file
-        client.print(String("GET ") + _bin + " HTTP/1.1\r\n" +
-                     "Host: " + _host + "\r\n" +
-                     "Cache-Control: no-cache\r\n" +
-                     "Connection: close\r\n\r\n");
+        _client->print(String("GET ") + _bin + " HTTP/1.1\r\n" +
+                       "Host: " + _host + "\r\n" +
+                       "Cache-Control: no-cache\r\n" +
+                       "Connection: close\r\n\r\n");
 
         unsigned long timeout = millis();
-        while (client.available() == 0)
+        while (_client->available() == 0)
         {
-            // if (millis() - timeout > 5000) // CHANGE 
-			if (millis() - timeout > 60000) // Kevin: More timeout
+            // if (millis() - timeout > 5000) // CHANGE
+            if (millis() - timeout > 60000) // Kevin: More timeout
             {
                 Serial.println("Client Timeout !");
-                client.stop();
+                _client->stop();
                 return;
             }
         }
 
-        while (client.available())
+        while (_client->available())
         {
             String header, headerValue;
             // read line till /n
-            String line = client.readStringUntil('\n');
+            String line = _client->readStringUntil('\n');
             // remove space, to check if the line is end of headers
             line.trim();
 
@@ -107,7 +89,7 @@ void esp32FOTAGSM::execOTA()
                 if (line.indexOf("200") < 0)
                 {
                     Serial.println("Got a non 200 status code from server. Exiting OTA Update.");
-                    client.stop();
+                    _client->stop();
                     break;
                 }
                 gotHTTPStatus = true;
@@ -140,6 +122,72 @@ void esp32FOTAGSM::execOTA()
                 }
             }
         }
+        // Check what is the contentLength and if content type is `application/octet-stream`
+        Serial.println("contentLength : " + String(contentLength) + ", isValidContentType : " + String(isValidContentType));
+
+        // check contentLength and content type
+        if (contentLength && isValidContentType)
+        {
+            // Setup Update onProgress callback
+            
+            Update.onProgress(
+                [](unsigned int progress, unsigned int total) {
+                    Serial.printf("Update Progress: %u of %u\r", progress, total);
+                }
+            );
+
+            // Check if there is enough to OTA Update
+            bool canBegin = Update.begin(contentLength);
+
+            // If yes, begin
+            if (canBegin)
+            {
+                Serial.println("Begin OTA. This may take several minutes to complete. Patience!");
+                size_t written = Update.writeStream(*_client);
+
+                if (written == contentLength)
+                {
+                    Serial.println("Written : " + String(written) + " successfully");
+                }
+                else
+                {
+                    Serial.println("Written only : " + String(written) + "/" + String(contentLength) + ". Retry?");
+                    // retry??
+                    // execOTA();
+                }
+
+                if (Update.end())
+                {
+                    Serial.println("OTA done!");
+                    if (Update.isFinished())
+                    {
+                        Serial.println("Update successfully completed. Rebooting.");
+                        ESP.restart();
+                    }
+                    else
+                    {
+                        Serial.println("Update not finished? Something went wrong!");
+                    }
+                }
+                else
+                {
+                    Serial.println("Error Occurred. Error #: " + String(Update.getError()));
+                }
+            }
+            else
+            {
+                // not enough space to begin OTA
+                // Understand the partitions and
+                // space availability
+                Serial.println("Not enough space to begin OTA");
+                _client->flush();
+            }
+        }
+        else
+        {
+            Serial.println("There was no content in the response");
+            _client->flush();
+        }
     }
     else
     {
@@ -150,84 +198,23 @@ void esp32FOTAGSM::execOTA()
         // retry??
         // execOTA();
     }
-
-    // Check what is the contentLength and if content type is `application/octet-stream`
-    Serial.println("contentLength : " + String(contentLength) + ", isValidContentType : " + String(isValidContentType));
-
-    // check contentLength and content type
-    if (contentLength && isValidContentType)
-    {
-        // Check if there is enough to OTA Update
-        bool canBegin = Update.begin(contentLength);
-
-        // If yes, begin
-        if (canBegin)
-        {
-            Serial.println("Begin OTA. This may take 2 - 5 mins to complete. Things might be quite for a while.. Patience!");
-            // No activity would appear on the Serial monitor
-            // So be patient. This may take 2 - 5mins to complete
-            size_t written = Update.writeStream(client);
-
-            if (written == contentLength)
-            {
-                Serial.println("Written : " + String(written) + " successfully");
-            }
-            else
-            {
-                Serial.println("Written only : " + String(written) + "/" + String(contentLength) + ". Retry?");
-                // retry??
-                // execOTA();
-            }
-
-            if (Update.end())
-            {
-                Serial.println("OTA done!");
-                if (Update.isFinished())
-                {
-                    Serial.println("Update successfully completed. Rebooting.");
-                    ESP.restart();
-                }
-                else
-                {
-                    Serial.println("Update not finished? Something went wrong!");
-                }
-            }
-            else
-            {
-                Serial.println("Error Occurred. Error #: " + String(Update.getError()));
-            }
-        }
-        else
-        {
-            // not enough space to begin OTA
-            // Understand the partitions and
-            // space availability
-            Serial.println("Not enough space to begin OTA");
-            client.flush();
-        }
-    }
-    else
-    {
-        Serial.println("There was no content in the response");
-        client.flush();
-    }
 }
 
 bool esp32FOTAGSM::execHTTPcheck()
 {
+    int contentLength = 0;
+    bool isValidContentType = false;
+    bool gotHTTPStatus = false;
 
     String useURL;
 
     if (useDeviceID)
     {
-        // String deviceID = getDeviceID() ;
-        // useURL = checkURL + "?id=" + getDeviceID();
-		useURL = checkRESOURCE + "?id=" + getDeviceID(); // Kevin
+        useURL = checkRESOURCE + "?id=" + getDeviceID();
     }
     else
     {
-        // useURL = checkURL;
-		useURL = checkRESOURCE; // Kevin
+        useURL = checkRESOURCE;
     }
 
     _port = 80;
@@ -235,51 +222,105 @@ bool esp32FOTAGSM::execHTTPcheck()
     Serial.println("Getting HTTP");
     Serial.println(useURL);
     Serial.println("------");
-	
-	// CHANGE
-	// if ((WiFi.status() == WL_CONNECTED))
-	if (_modem->isGprsConnected())
-    { //Check the current connection status
 
-        // HTTPClient http;		   // TO CHANGE: Dont know if works
+    //current connection status should be checked before calling this function
 
-        // http.begin(useURL);        //Specify the URL
-		// TinyGsmClient client((TinyGsm*)_modem);		// Kevin // Set o day bi bao loi. La thiet
-		TinyGsmClient client;
-		bool isClientOK = client.init(_modem);		// Kevin: return 1 => OK
-		// Serial.println("isClientOK: "+ String(isClientOK));
-		
-		// HttpClient    http(client, _host, _port); // Kevin
-		HttpClient    http(client, checkHOST, checkPORT); // Kevin
-        // int httpCode = http.GET(); //Make the request
-		// Serial.println("useURL: " + useURL);
-		// Serial.println("GPRS connected");
-				
-		int err = http.get(useURL);  // Kevin
-		// Serial.println("TinyGsmClient: " + String(client.connected()));
-		if (err != 0) {
-			Serial.println(F("failed to connect"));
-			delay(10000);
-			return false; // Error, nothing to update
-		}
-		else
-		{
-			// Hinh nhu cho nay ok
-			// Serial.println("http err:" + String(err));
-		}
-		
-		int httpCode = http.responseStatusCode();
-		// Serial.println("httpCode:" + String(httpCode));
-		
-        if (httpCode == 200)
-        { //Check is a file was returned
+    _client->setTimeout(60000); // Kevin, muchlonger wait
 
-            // String payload = http.getString(); // CHANGE 
-			String payload = http.responseBody();	// CHANGE
+    if (_client->connect(checkHOST.c_str(), checkPORT))
+    {
+        // Connection Succeed.
+        // Fetching the bin
+        Serial.println("Fetching JSON:" + useURL);
 
-            int str_len = payload.length() + 1;
-            char JSONMessage[str_len];
-            payload.toCharArray(JSONMessage, str_len);
+        // Get the contents of the bin file
+        _client->print(String("GET ") + checkRESOURCE + " HTTP/1.1\r\n" +
+                       "Host: " + checkHOST + "\r\n" +
+                       "Cache-Control: no-cache\r\n" +
+                       "Connection: close\r\n\r\n");
+
+        unsigned long timeout = millis();
+        while (_client->available() == 0)
+        {
+            // if (millis() - timeout > 5000) // CHANGE
+            if (millis() - timeout > 60000) // Kevin: More timeout
+            {
+                Serial.println("Client Timeout !");
+                _client->stop();
+                return false;
+            }
+        }
+
+        while (_client->available())
+        {
+            String header, headerValue;
+            // read line till /n
+            String line = _client->readStringUntil('\n');
+            // remove space, to check if the line is end of headers
+            line.trim();
+
+            if (!line.length())
+            {
+                //headers ended
+                break; // and get the OTA started
+            }
+
+            // Check if the HTTP Response is 200
+            // else break and Exit Update
+            if (line.startsWith("HTTP/1.1"))
+            {
+                if (line.indexOf("200") < 0)
+                {
+                    Serial.println("Got a non 200 status code from server. Exiting OTA Update.");
+                    _client->stop();
+                    break;
+                }
+                gotHTTPStatus = true;
+            }
+
+            if (false == gotHTTPStatus)
+            {
+                continue;
+            }
+
+            splitHeader(line, header, headerValue);
+
+            // extract headers here
+            // Start with content length
+            if (header.equalsIgnoreCase("Content-Length"))
+            {
+                contentLength = headerValue.toInt();
+                Serial.println("Got " + String(contentLength) + " bytes from server");
+                continue;
+            }
+
+            // Next, the content type
+            if (header.equalsIgnoreCase("Content-type"))
+            {
+                String contentType = headerValue;
+                Serial.println("Got " + contentType + " payload.");
+                if (contentType == "application/json")
+                {
+                    isValidContentType = true;
+                }
+            }
+        }
+
+        // Check what is the contentLength and if content type is `application/octet-stream`
+        Serial.println("contentLength : " + String(contentLength) + ", isValidContentType : " + String(isValidContentType));
+
+        // check if the contectLength is bigger than the buffer size
+        if (contentLength > 256)
+        {
+            Serial.println("contentLength is bigger than 256 bytes. Exiting Update check.");
+            return false;
+        }
+
+        // check contentLength and content type
+        if (contentLength && isValidContentType)
+        {
+            char JSONMessage[256];
+            _client->readBytes(JSONMessage, contentLength);
 
             StaticJsonDocument<300> JSONDocument; //Memory pool
             DeserializationError err = deserializeJson(JSONDocument, JSONMessage);
@@ -305,6 +346,10 @@ bool esp32FOTAGSM::execHTTPcheck()
 
             String fwtype(pltype);
 
+            Serial.println(plhost);
+            Serial.println(plbin);
+            Serial.println(fwtype);
+
             if (plversion > _firwmareVersion && fwtype == _firwmareType)
             {
                 return true;
@@ -314,20 +359,18 @@ bool esp32FOTAGSM::execHTTPcheck()
                 return false;
             }
         }
-
         else
         {
-            // Serial.println("Error on HTTP request");
-			Serial.print("Error on HTTP request. Error code:");
-			Serial.println(httpCode);
-            return false;
+            Serial.println("There was no content in the response");
+            _client->flush();
         }
-
-        // http.end(); //Free the resources
-		http.stop();   // Kevin
+    }
+    else
+    {
+        // Connect to webserver failed
+        Serial.println("Connection to " + String(checkHOST) + " failed.");
         return false;
     }
-    return false;
 }
 
 String esp32FOTAGSM::getDeviceID()
@@ -349,7 +392,7 @@ void esp32FOTAGSM::forceUpdate(String firmwareHost, int firmwarePort, String fir
     execOTA();
 }
 
-void esp32FOTAGSM::setModem(TinyGsm& modem)
+void esp32FOTAGSM::setClient(Client &client)
 {
-	_modem = &modem;
+    this->_client = &client;
 }
