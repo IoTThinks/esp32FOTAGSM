@@ -14,7 +14,7 @@ class esp32FOTAGSM
 public:
   esp32FOTAGSM(Client& client, String firwmareType, int firwmareVersion);
   void forceUpdate(String firwmareHost, int firwmarePort, String firwmarePath);
-  void execOTA();
+  bool execOTA();
   bool execHTTPcheck();
   bool useDeviceID;
   // String checkURL; 	// ArduinoHttpClient requires host, port and resource instead
