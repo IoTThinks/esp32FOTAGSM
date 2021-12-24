@@ -8,29 +8,47 @@
 #define esp32FOTAGSM_h
 
 #include "Arduino.h"
+#include <FreeRTOS.h>
 
 class esp32FOTAGSM
 {
 public:
-  esp32FOTAGSM(Client& client, String firwmareType, int firwmareVersion);
+  typedef std::function<bool(void)> TConnectionCheckFunction;
+
+  esp32FOTAGSM(Client &client, String firwmareType, int firwmareVersion,
+               TConnectionCheckFunction connectionCheckFunction = NULL,
+               SemaphoreHandle_t networkSemaphore = NULL,
+               int ledPin = -1,
+               uint8_t ledOn = LOW,
+               bool chunkedDownload = false
+               );
+
   void forceUpdate(String firwmareHost, int firwmarePort, String firwmarePath);
   bool execOTA();
   bool execHTTPcheck();
   bool useDeviceID;
-  // String checkURL; 	// ArduinoHttpClient requires host, port and resource instead
-  String checkHOST; 	// example.com
-  int checkPORT;		// 80  
+  String checkHOST;     // example.com
+  int checkPORT;        // 80
   String checkRESOURCE; // /customer01/firmware.json
-  void setClient(Client& client);
+  void setClient(Client &client);
 
 private:
-  String getDeviceID();
+  bool _checkConnection();
+  void _blockingNetworkSemaphoreTake();
+  void _blockingNetworkSemaphoreGive();
+  String _getDeviceID();
+
   String _firwmareType;
   int _firwmareVersion;
   String _host;
   String _bin;
   int _port;
-  Client* _client;
+  Client *_client;
+  SemaphoreHandle_t _networkSemaphore;
+  TConnectionCheckFunction _connectionCheckFunction;
+  int _ledPin;
+  uint8_t _ledOn;
+  bool _chunkedDownload;
 };
 
 #endif

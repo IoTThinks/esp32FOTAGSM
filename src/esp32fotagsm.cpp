@@ -11,14 +11,48 @@
 #include "esp_log.h"
 
 #define CLIENT_TIMEOUT_MS (60000)
-#define DOWNLOAD_CHUNK_SIZE (4096)
+#define DOWNLOAD_CHUNK_SIZE (8192)
 
-esp32FOTAGSM::esp32FOTAGSM(Client &client, String firwmareType, int firwmareVersion)
+esp32FOTAGSM::esp32FOTAGSM(Client &client, String firwmareType, int firwmareVersion,
+                           TConnectionCheckFunction connectionCheckFunction,
+                           SemaphoreHandle_t networkSemaphore,
+                           int ledPin,
+                           uint8_t ledOn,
+                           bool chunkedDownload)
 {
     this->setClient(client);
     _firwmareType = firwmareType;
     _firwmareVersion = firwmareVersion;
+    _connectionCheckFunction = connectionCheckFunction;
+    _networkSemaphore = networkSemaphore;
+    _ledPin = ledPin;
+    _ledOn = ledOn;
+    _chunkedDownload = chunkedDownload;
     useDeviceID = false;
+}
+
+bool esp32FOTAGSM::_checkConnection()
+{
+    if (_connectionCheckFunction != NULL)
+    {
+        return _connectionCheckFunction();
+    }
+}
+
+void esp32FOTAGSM::_blockingNetworkSemaphoreTake()
+{
+    if (_networkSemaphore != NULL)
+    {
+        xSemaphoreTake(_networkSemaphore, portMAX_DELAY);
+    }
+}
+
+void esp32FOTAGSM::_blockingNetworkSemaphoreGive()
+{
+    if (_networkSemaphore != NULL)
+    {
+        xSemaphoreGive(_networkSemaphore);
+    }
 }
 
 static void splitHeader(String src, String &header, String &headerValue)
@@ -185,9 +219,10 @@ bool esp32FOTAGSM::execOTA()
 
                 while (remainig_bytes > 0)
                 {
-                    if(!_client->connected()){
+                    if (!_client->connected())
+                    {
                         ESP_LOGE(TAG, "Client Disconnected");
-                        
+
                         // Connect to Webserver
                         if (_client->connect(_host.c_str(), _port))
                         {
@@ -200,21 +235,23 @@ bool esp32FOTAGSM::execOTA()
                             continue;
                         }
                     }
-                    else{
+                    else
+                    {
                         ESP_LOGD(TAG, "Client Connected");
                         ESP_LOGD(TAG, "Downloading a chunk from bytes %u to %u, remaining bytes: %u", chunk_first_byte, chunk_last_byte, remainig_bytes);
 
-                        if(remainig_bytes < DOWNLOAD_CHUNK_SIZE){
+                        if (remainig_bytes < DOWNLOAD_CHUNK_SIZE)
+                        {
                             chunk_last_byte = chunk_first_byte + remainig_bytes - 1;
                         }
 
                         _client->flush();
                         // Get the contents of the bin file
                         _client->print(String("GET ") + _bin + " HTTP/1.1\r\n" +
-                                    "Host: " + _host + "\r\n" +
-                                    "Cache-Control: no-cache\r\n" +
-                                    "Range: bytes=" + String(chunk_first_byte) + "-" + String(chunk_last_byte) + "\r\n" +
-                                    "Connection: keep-alive\r\n\r\n");
+                                       "Host: " + _host + "\r\n" +
+                                       "Cache-Control: no-cache\r\n" +
+                                       "Range: bytes=" + String(chunk_first_byte) + "-" + String(chunk_last_byte) + "\r\n" +
+                                       "Connection: keep-alive\r\n\r\n");
 
                         timeout = millis();
                         while (_client->available() == 0)
@@ -267,7 +304,9 @@ bool esp32FOTAGSM::execOTA()
                                 {
                                     ESP_LOGD(TAG, "Server will keep the connection alive");
                                     should_close_connection = false;
-                                }else{
+                                }
+                                else
+                                {
                                     ESP_LOGD(TAG, "Server will close the connection");
                                     should_close_connection = true;
                                 }
@@ -278,7 +317,6 @@ bool esp32FOTAGSM::execOTA()
                                 ESP_LOGD(TAG, "Content-Range: %s", headerValue.c_str());
                                 // @TODO: check if the content range is valid
                             }
-
                         }
 
                         // Read the payload
@@ -299,7 +337,8 @@ bool esp32FOTAGSM::execOTA()
                         chunk_first_byte += DOWNLOAD_CHUNK_SIZE;
                         chunk_last_byte += DOWNLOAD_CHUNK_SIZE;
 
-                        if(should_close_connection){
+                        if (should_close_connection)
+                        {
                             ESP_LOGD(TAG, "Server will close the connection, so we will close the client");
                             _client->stop();
                             delay(1000);
@@ -317,9 +356,9 @@ bool esp32FOTAGSM::execOTA()
                 {
                     // Get the contents of the bin file
                     _client->print(String("GET ") + _bin + " HTTP/1.1\r\n" +
-                                "Host: " + _host + "\r\n" +
-                                "Cache-Control: no-cache\r\n" +
-                                "Connection: close\r\n\r\n");
+                                   "Host: " + _host + "\r\n" +
+                                   "Cache-Control: no-cache\r\n" +
+                                   "Connection: close\r\n\r\n");
 
                     timeout = millis();
                     while (_client->available() == 0)
@@ -357,7 +396,6 @@ bool esp32FOTAGSM::execOTA()
                     ESP_LOGD(TAG, "Connection to %s failed!", _host.c_str());
                     return false;
                 }
-                
             }
 
             if (written == contentLength)
@@ -417,7 +455,7 @@ bool esp32FOTAGSM::execHTTPcheck()
 
     if (useDeviceID)
     {
-        useURL = checkRESOURCE + "?id=" + getDeviceID();
+        useURL = checkRESOURCE + "?id=" + _getDeviceID();
     }
     else
     {
@@ -575,7 +613,7 @@ bool esp32FOTAGSM::execHTTPcheck()
     }
 }
 
-String esp32FOTAGSM::getDeviceID()
+String esp32FOTAGSM::_getDeviceID()
 {
     char deviceid[21];
     uint64_t chipid;
