@@ -10,24 +10,24 @@
 #include "ArduinoJson.h"
 #include "esp_log.h"
 
-#define CLIENT_TIMEOUT_MS (60000)
-#define DOWNLOAD_CHUNK_SIZE (8192)
+#define CLIENT_TIMEOUT_MS (120000)
+#define DOWNLOAD_CHUNK_SIZE (16380)//(8192)
 
-esp32FOTAGSM::esp32FOTAGSM(Client &client, String firwmareType, int firwmareVersion,
-                           TConnectionCheckFunction connectionCheckFunction,
-                           SemaphoreHandle_t networkSemaphore,
-                           int ledPin,
-                           uint8_t ledOn,
-                           bool chunkedDownload)
+esp32FOTAGSM::esp32FOTAGSM(Client &client, 
+                            String firwmareType, int firwmareVersion,
+                            TConnectionCheckFunction connectionCheckFunction,
+                            SemaphoreHandle_t networkSemaphore,
+                            int ledPin,
+                            uint8_t ledOn,
+                            bool chunkedDownload)
+                            :
+                            _ledPin(ledPin),
+                            _ledOn(ledOn),
+                            _chunkedDownload(chunkedDownload)
 {
     this->setClient(client);
-    _firwmareType = firwmareType;
-    _firwmareVersion = firwmareVersion;
-    _connectionCheckFunction = connectionCheckFunction;
-    _networkSemaphore = networkSemaphore;
-    _ledPin = ledPin;
-    _ledOn = ledOn;
-    _chunkedDownload = chunkedDownload;
+    this->setConnectionCheckFunction(connectionCheckFunction);
+    this->setNetworkSemaphore(networkSemaphore);
     useDeviceID = false;
 }
 
@@ -36,6 +36,9 @@ bool esp32FOTAGSM::_checkConnection()
     if (_connectionCheckFunction != NULL)
     {
         return _connectionCheckFunction();
+    }else{
+        ESP_LOGD(TAG, "No connection check function defined");
+        return true;
     }
 }
 
@@ -43,7 +46,10 @@ void esp32FOTAGSM::_blockingNetworkSemaphoreTake()
 {
     if (_networkSemaphore != NULL)
     {
+        ESP_LOGD(TAG, "Taking network semaphore (blocking)");
         xSemaphoreTake(_networkSemaphore, portMAX_DELAY);
+    }else{
+        ESP_LOGD(TAG, "No network semaphore");
     }
 }
 
@@ -51,7 +57,10 @@ void esp32FOTAGSM::_blockingNetworkSemaphoreGive()
 {
     if (_networkSemaphore != NULL)
     {
+        ESP_LOGD(TAG, "Giving network semaphore");
         xSemaphoreGive(_networkSemaphore);
+    }else{
+        ESP_LOGD(TAG, "No network semaphore");
     }
 }
 
@@ -76,11 +85,13 @@ bool esp32FOTAGSM::execOTA()
     bool Accept_Ranges_bytes = false;
     bool gotHTTPStatus = false;
 
-    size_t written = 0;
+    size_t total_written_bytes = 0;
+    size_t last_written_bytes = 0;
 
     ESP_LOGD(TAG, "Connecting to: %S", _host.c_str());
 
     _client->setTimeout(CLIENT_TIMEOUT_MS);
+    ESP_LOGD(TAG, "timeout set to: %d", CLIENT_TIMEOUT_MS);
 
     // Connect to Webserver
     if (_client->connect(_host.c_str(), _port))
@@ -214,11 +225,21 @@ bool esp32FOTAGSM::execOTA()
                 uint chunk_first_byte = 0;
                 uint chunk_last_byte = DOWNLOAD_CHUNK_SIZE - 1;
                 uint remainig_bytes = contentLength;
-                uint8_t chunk_buffer[DOWNLOAD_CHUNK_SIZE];
+                uint8_t chunk_buffer[DOWNLOAD_CHUNK_SIZE + 1];
                 bool should_close_connection = false;
 
                 while (remainig_bytes > 0)
                 {
+                    if (!_checkConnection())
+                    {
+                        ESP_LOGE(TAG, "Connection lost. Retrying in 5 seconds");
+                        delay(5000);
+                        continue;
+                    }
+
+                    _blockingNetworkSemaphoreTake();
+
+                    // check if the connection is still alive
                     if (!_client->connected())
                     {
                         ESP_LOGE(TAG, "Client Disconnected");
@@ -227,23 +248,32 @@ bool esp32FOTAGSM::execOTA()
                         if (_client->connect(_host.c_str(), _port))
                         {
                             ESP_LOGD(TAG, "client connected");
+                            _blockingNetworkSemaphoreGive();
                         }
                         else
                         {
                             ESP_LOGD(TAG, "Connection to %s failed! Retrying in 5 seconds", _host.c_str());
+                            _blockingNetworkSemaphoreGive();
                             delay(5000);
                             continue;
                         }
                     }
                     else
                     {
-                        ESP_LOGD(TAG, "Client Connected");
-                        ESP_LOGD(TAG, "Downloading a chunk from bytes %u to %u, remaining bytes: %u", chunk_first_byte, chunk_last_byte, remainig_bytes);
 
                         if (remainig_bytes < DOWNLOAD_CHUNK_SIZE)
                         {
+                            ESP_LOGW(TAG, "Last chunk of %d bytes", remainig_bytes);
                             chunk_last_byte = chunk_first_byte + remainig_bytes - 1;
                         }
+
+                        if( chunk_last_byte - chunk_first_byte > DOWNLOAD_CHUNK_SIZE)
+                        {
+                            ESP_LOGW(TAG, "Chunk size is too big, adjust to DOWNLOAD_CHUNK_SIZE");
+                            chunk_last_byte = chunk_first_byte + DOWNLOAD_CHUNK_SIZE - 1;
+                        }
+
+                        ESP_LOGD(TAG, "Downloading a chunk from bytes %u to %u, remaining bytes: %u", chunk_first_byte, chunk_last_byte, remainig_bytes);
 
                         _client->flush();
                         // Get the contents of the bin file
@@ -258,7 +288,7 @@ bool esp32FOTAGSM::execOTA()
                         {
                             if (millis() - timeout > CLIENT_TIMEOUT_MS)
                             {
-                                ESP_LOGD(TAG, "Client Timeout !");
+                                ESP_LOGD(TAG, "Client Timeout!");
                                 _client->stop();
                                 return false;
                             }
@@ -319,30 +349,47 @@ bool esp32FOTAGSM::execOTA()
                             }
                         }
 
+                        uint bytes_to_read = chunk_last_byte - chunk_first_byte + 1;
+
                         // Read the payload
-                        size_t readed_bytes = _client->readBytes(chunk_buffer, chunk_last_byte - chunk_first_byte + 1);
+                        size_t readed_bytes = _client->readBytes(chunk_buffer, bytes_to_read);
                         ESP_LOGD(TAG, "Readed %u bytes from payload", readed_bytes);
 
+                        // Check if the readed bytes are same as the expected bytes
+                        if (readed_bytes != bytes_to_read)
+                        {
+                            ESP_LOGE(TAG, "Expected %u bytes but got %u", bytes_to_read, readed_bytes);
+                            
+                            // We readed less than expected, so we update the chunk_last_byte acordingly
+                            chunk_last_byte = chunk_first_byte + readed_bytes - 1;
+                        }
+
                         // Write chunk to flash
-                        written += Update.write(chunk_buffer, readed_bytes);
-                        ESP_LOGD(TAG, "Written %u bytes to flash", written);
+                        last_written_bytes = Update.write(chunk_buffer, readed_bytes);
+                        total_written_bytes += last_written_bytes;
 
-                        remainig_bytes -= readed_bytes;
+                        // Check if the written bytes are same as the expected bytes
+                        if (last_written_bytes != readed_bytes)
+                        {
+                            ESP_LOGE(TAG, "Expected to write %u bytes but %u were written", readed_bytes, total_written_bytes);
+                        }else{
+                            ESP_LOGD(TAG, "Written %u bytes to flash", total_written_bytes);
+                        }
 
-                        /*
-                        @TODO check if written == readed_bytes. If not, we should retry the chunk download, 
-                        adjusting the chunk_last_byte and chunk_first_byte acordingly.
-                        */
-                        // Increment chunk
-                        chunk_first_byte += DOWNLOAD_CHUNK_SIZE;
-                        chunk_last_byte += DOWNLOAD_CHUNK_SIZE;
+                        chunk_first_byte += last_written_bytes;
+                        chunk_last_byte += last_written_bytes;
+                        remainig_bytes -= last_written_bytes;
+
+                        ESP_LOGD(TAG, "next chunk from bytes %u to %u, remaining bytes: %u", chunk_first_byte, chunk_last_byte, remainig_bytes);
 
                         if (should_close_connection)
                         {
-                            ESP_LOGD(TAG, "Server will close the connection, so we will close the client");
+                            ESP_LOGD(TAG, "Server will close the connection, so we will stop the client to reconnect again later");
                             _client->stop();
                             delay(1000);
                         }
+                        _blockingNetworkSemaphoreGive();
+                        delay(250); //give some time for other threads to take the semaphore
                     }
                 }
             }
@@ -389,7 +436,7 @@ bool esp32FOTAGSM::execOTA()
                     }
 
                     ESP_LOGD(TAG, "Begin OTA. This may take several minutes to complete. Patience!");
-                    written = Update.writeStream(*_client);
+                    total_written_bytes = Update.writeStream(*_client);
                 }
                 else
                 {
@@ -398,13 +445,13 @@ bool esp32FOTAGSM::execOTA()
                 }
             }
 
-            if (written == contentLength)
+            if (total_written_bytes == contentLength)
             {
-                ESP_LOGD(TAG, "Written: %d successfully", written);
+                ESP_LOGD(TAG, "Written: %d successfully", total_written_bytes);
             }
             else
             {
-                ESP_LOGD(TAG, "Written only : %d of %d. OTA will not proceed. ", written, contentLength);
+                ESP_LOGD(TAG, "Written only : %d of %d. OTA will not proceed. ", total_written_bytes, contentLength);
             }
 
             if (Update.end())
@@ -413,6 +460,11 @@ bool esp32FOTAGSM::execOTA()
                 if (Update.isFinished())
                 {
                     ESP_LOGD(TAG, "Update successfully completed. Rebooting.");
+                    while (1)
+                    {
+                        /* code */
+                    }
+                    
                     ESP.restart();
                 }
                 else
@@ -636,3 +688,15 @@ void esp32FOTAGSM::setClient(Client &client)
 {
     this->_client = &client;
 }
+
+// set connection check function
+void esp32FOTAGSM::setConnectionCheckFunction(TConnectionCheckFunction connectionCheckFunction)
+{
+    this->_connectionCheckFunction = connectionCheckFunction;
+}
+
+void esp32FOTAGSM::setNetworkSemaphore(SemaphoreHandle_t networkSemaphore)
+{
+    this->_networkSemaphore = networkSemaphore;
+}
+

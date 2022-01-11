@@ -9,6 +9,7 @@
 
 #include "Arduino.h"
 #include <FreeRTOS.h>
+#include <functional>
 
 class esp32FOTAGSM
 {
@@ -16,8 +17,8 @@ public:
   typedef std::function<bool(void)> TConnectionCheckFunction;
 
   esp32FOTAGSM(Client &client, String firwmareType, int firwmareVersion,
-               TConnectionCheckFunction connectionCheckFunction = NULL,
-               SemaphoreHandle_t networkSemaphore = NULL,
+               TConnectionCheckFunction connectionCheckFunction,
+               SemaphoreHandle_t networkSemaphore,
                int ledPin = -1,
                uint8_t ledOn = LOW,
                bool chunkedDownload = false
@@ -31,6 +32,8 @@ public:
   int checkPORT;        // 80
   String checkRESOURCE; // /customer01/firmware.json
   void setClient(Client &client);
+  void setConnectionCheckFunction(TConnectionCheckFunction connectionCheckFunction);
+  void setNetworkSemaphore(SemaphoreHandle_t networkSemaphore);
 
 private:
   bool _checkConnection();
