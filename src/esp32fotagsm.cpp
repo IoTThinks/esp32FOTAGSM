@@ -288,10 +288,18 @@ bool esp32FOTAGSM::execOTA()
                         {
                             if (millis() - timeout > CLIENT_TIMEOUT_MS)
                             {
-                                ESP_LOGD(TAG, "Client Timeout!");
-                                _client->stop();
-                                return false;
+                                ESP_LOGD(TAG, "No data from server for %d ms", CLIENT_TIMEOUT_MS);
+                                break;
                             }
+                        }
+                        // At this point we should have data to read, if not, we will retry
+                        if(_client->available() == 0)
+                        {
+                            ESP_LOGD(TAG, "Closing connection and waiting 5s to reconnect");
+                            _client->stop();
+                            _blockingNetworkSemaphoreGive();
+                            delay(5000);
+                            continue;
                         }
 
                         // Read the headers
@@ -459,6 +467,7 @@ bool esp32FOTAGSM::execOTA()
                 ESP_LOGD(TAG, "OTA done!");
                 if (Update.isFinished())
                 {
+                    ESP_LOGD(TAG, "Update MD5: %s", Update.md5String().c_str());
                     ESP_LOGD(TAG, "Update successfully completed. Rebooting.");
                     while (1)
                     {
