@@ -6,22 +6,62 @@
 
 #include "esp32fotagsm.h"
 #include "Arduino.h"
-// #include <WiFi.h>   // CHANGE
-// #include <HTTPClient.h>	// CHANGE
-#include <ArduinoHttpClient.h> // Kevin
 #include <Update.h>
 #include "ArduinoJson.h"
+#include "esp_log.h"
 
-#if (!defined(SRC_TINYGSMCLIENT_H_))
-#define TINY_GSM_MODEM_SIM800
-#include <TinyGsmClient.h>
-#endif  // SRC_TINYGSMCLIENT_H_
+#define CLIENT_TIMEOUT_MS (120000)
+#define DOWNLOAD_CHUNK_SIZE (16380)//(8192)
 
-esp32FOTAGSM::esp32FOTAGSM(String firwmareType, int firwmareVersion)
+esp32FOTAGSM::esp32FOTAGSM(Client &client, 
+                            String firwmareType, int firwmareVersion,
+                            TConnectionCheckFunction connectionCheckFunction,
+                            SemaphoreHandle_t networkSemaphore,
+                            int ledPin,
+                            uint8_t ledOn,
+                            bool chunkedDownload)
+                            :
+                            _ledPin(ledPin),
+                            _ledOn(ledOn),
+                            _chunkedDownload(chunkedDownload)
 {
-    _firwmareType = firwmareType;
-    _firwmareVersion = firwmareVersion;
+    this->setClient(client);
+    this->setConnectionCheckFunction(connectionCheckFunction);
+    this->setNetworkSemaphore(networkSemaphore);
     useDeviceID = false;
+}
+
+bool esp32FOTAGSM::_checkConnection()
+{
+    if (_connectionCheckFunction != NULL)
+    {
+        return _connectionCheckFunction();
+    }else{
+        ESP_LOGD(TAG, "No connection check function defined");
+        return true;
+    }
+}
+
+void esp32FOTAGSM::_blockingNetworkSemaphoreTake()
+{
+    if (_networkSemaphore != NULL)
+    {
+        ESP_LOGD(TAG, "Taking network semaphore (blocking)");
+        xSemaphoreTake(_networkSemaphore, portMAX_DELAY);
+    }else{
+        ESP_LOGD(TAG, "No network semaphore");
+    }
+}
+
+void esp32FOTAGSM::_blockingNetworkSemaphoreGive()
+{
+    if (_networkSemaphore != NULL)
+    {
+        ESP_LOGD(TAG, "Giving network semaphore");
+        xSemaphoreGive(_networkSemaphore);
+    }else{
+        ESP_LOGD(TAG, "No network semaphore");
+    }
 }
 
 static void splitHeader(String src, String &header, String &headerValue)
@@ -37,60 +77,57 @@ static void splitHeader(String src, String &header, String &headerValue)
 }
 
 // OTA Logic
-void esp32FOTAGSM::execOTA()
+bool esp32FOTAGSM::execOTA()
 {
-	// CHANGE
-	// https://github.com/blynkkk/blynk-library/blob/master/src/Adapters/BlynkGsmClient.h#L99
-	// WiFiClient client;
-	// TinyGsmClient client(_modem); => not able to compile
-	TinyGsmClient client;
-	bool isClientOK = client.init(_modem);
-	// Serial.println("isClientOK: "+ String(isClientOK));
-	
+    unsigned long timeout = 0;
     int contentLength = 0;
     bool isValidContentType = false;
+    bool Accept_Ranges_bytes = false;
     bool gotHTTPStatus = false;
 
-    Serial.println("Connecting to: " + String(_host));
-	
-	// https://github.com/espressif/arduino-esp32/issues/325
-	// Written only : 0/564608. Retry?
-	// Error Occurred. Error #: 8
-	// client.setTimeout(5000); // Kevin, a bit longer wait
-	client.setTimeout(60000); // Kevin, muchlonger wait
-	
+    size_t total_written_bytes = 0;
+    size_t last_written_bytes = 0;
+
+    ESP_LOGD(TAG, "Connecting to: %S", _host.c_str());
+
+    _client->setTimeout(CLIENT_TIMEOUT_MS);
+    ESP_LOGD(TAG, "timeout set to: %d", CLIENT_TIMEOUT_MS);
+
+    _blockingNetworkSemaphoreTake();
     // Connect to Webserver
-    if (client.connect(_host.c_str(), _port))
+    if (_client->connect(_host.c_str(), _port))
     {
-		// client.setTimeout(60000); // Kevin, longer wait // REMOVED
-		
+
         // Connection Succeed.
-        // Fetching the bin
-        Serial.println("Fetching Bin: " + String(_bin));
+        // Fetching the bin HEAD
+        ESP_LOGD(TAG, "Fetching Bin HEAD: %s", _bin.c_str());
 
         // Get the contents of the bin file
-        client.print(String("GET ") + _bin + " HTTP/1.1\r\n" +
-                     "Host: " + _host + "\r\n" +
-                     "Cache-Control: no-cache\r\n" +
-                     "Connection: close\r\n\r\n");
+        _client->print(String("HEAD ") + _bin + " HTTP/1.1\r\n" +
+                       "Host: " + _host + "\r\n" +
+                       "Cache-Control: no-cache\r\n" +
+                       "Connection: close\r\n\r\n");
 
-        unsigned long timeout = millis();
-        while (client.available() == 0)
+        timeout = millis();
+        while (_client->available() == 0)
         {
-            // if (millis() - timeout > 5000) // CHANGE 
-			if (millis() - timeout > 60000) // Kevin: More timeout
+            if (millis() - timeout > CLIENT_TIMEOUT_MS)
             {
-                Serial.println("Client Timeout !");
-                client.stop();
-                return;
+                ESP_LOGD(TAG, "Client Timeout !");
+                _client->stop();
+                _blockingNetworkSemaphoreGive();
+                return false;
             }
         }
 
-        while (client.available())
+        while (_client->available())
         {
             String header, headerValue;
             // read line till /n
-            String line = client.readStringUntil('\n');
+            String line = _client->readStringUntil('\n');
+
+            ESP_LOGD(TAG, "Header line: %s", line.c_str());
+
             // remove space, to check if the line is end of headers
             line.trim();
 
@@ -106,8 +143,445 @@ void esp32FOTAGSM::execOTA()
             {
                 if (line.indexOf("200") < 0)
                 {
-                    Serial.println("Got a non 200 status code from server. Exiting OTA Update.");
-                    client.stop();
+                    ESP_LOGE(TAG, "Got a non 200 status code from server. Exiting OTA Update.");
+                    _client->stop();
+                    break;
+                }
+                gotHTTPStatus = true;
+            }
+
+            if (false == gotHTTPStatus)
+            {
+                continue;
+            }
+
+            splitHeader(line, header, headerValue);
+
+            // extract headers here
+            // Content-Length
+            if (header.equalsIgnoreCase("Content-Length"))
+            {
+                contentLength = headerValue.toInt();
+                ESP_LOGD(TAG, "Content-Length: %d", contentLength);
+            }
+            // Content-type
+            else if (header.equalsIgnoreCase("Content-type"))
+            {
+                String contentType = headerValue;
+                ESP_LOGD(TAG, "Content-type: %s", contentType.c_str());
+                if (contentType == "application/octet-stream")
+                {
+                    ESP_LOGD(TAG, "Valid Content-type");
+                    isValidContentType = true;
+                }
+            }
+            // Accept-Ranges
+            else if (header.equalsIgnoreCase("Accept-Ranges"))
+            {
+                String contentType = headerValue;
+                ESP_LOGD(TAG, "Accept-Ranges: %s", contentType.c_str());
+                if (contentType == "bytes")
+                {
+                    ESP_LOGD(TAG, "Server supports range requests");
+                    Accept_Ranges_bytes = true;
+                }
+            }
+        }
+    }
+    else
+    {
+        ESP_LOGD(TAG, "Connection to %s failed!", _host.c_str());
+        _blockingNetworkSemaphoreGive();
+        return false;
+    }
+
+    // We will open a new connection to the server later
+    _client->stop();
+    _blockingNetworkSemaphoreGive();
+
+    // check contentLength and content type
+    if (contentLength && isValidContentType)
+    {
+
+        // Check if there is enough to OTA Update.
+        if (Update.begin(contentLength))
+        {
+            ESP_LOGD(TAG, "OTA file can be downloaded.");
+
+            // Setup Update onProgress callback
+            Update.onProgress(
+                [](unsigned int progress, unsigned int total)
+                {
+                    ESP_LOGI(TAG, "Update Progress: %u of %u", progress, total);
+                });
+
+            if (Accept_Ranges_bytes)
+            {
+                ESP_LOGD(TAG, "OTA file will be downloaded in chunks");
+
+                // Number of chunks
+                int numChunks = contentLength / DOWNLOAD_CHUNK_SIZE;
+                if (contentLength % DOWNLOAD_CHUNK_SIZE)
+                {
+                    numChunks++;
+                }
+
+                uint chunk_first_byte = 0;
+                uint chunk_last_byte = DOWNLOAD_CHUNK_SIZE - 1;
+                uint remainig_bytes = contentLength;
+                uint8_t chunk_buffer[DOWNLOAD_CHUNK_SIZE + 1];
+                bool should_close_connection = false;
+
+                while (remainig_bytes > 0)
+                {
+                    if (!_checkConnection())
+                    {
+                        ESP_LOGE(TAG, "Connection lost. Retrying in 5 seconds");
+                        delay(5000);
+                        continue;
+                    }
+
+                    _blockingNetworkSemaphoreTake();
+
+                    // check if the connection is still alive
+                    if (!_client->connected())
+                    {
+                        ESP_LOGE(TAG, "Client Disconnected");
+
+                        // Connect to Webserver
+                        if (_client->connect(_host.c_str(), _port))
+                        {
+                            ESP_LOGD(TAG, "client connected");
+                            _blockingNetworkSemaphoreGive();
+                        }
+                        else
+                        {
+                            ESP_LOGD(TAG, "Connection to %s failed! Retrying in 5 seconds", _host.c_str());
+                            _blockingNetworkSemaphoreGive();
+                            delay(5000);
+                            continue;
+                        }
+                    }
+                    else
+                    {
+
+                        if (remainig_bytes < DOWNLOAD_CHUNK_SIZE)
+                        {
+                            ESP_LOGW(TAG, "Last chunk of %d bytes", remainig_bytes);
+                            chunk_last_byte = chunk_first_byte + remainig_bytes - 1;
+                        }
+
+                        if( chunk_last_byte - chunk_first_byte > DOWNLOAD_CHUNK_SIZE)
+                        {
+                            ESP_LOGW(TAG, "Chunk size is too big, adjust to DOWNLOAD_CHUNK_SIZE");
+                            chunk_last_byte = chunk_first_byte + DOWNLOAD_CHUNK_SIZE - 1;
+                        }
+
+                        ESP_LOGD(TAG, "Downloading a chunk from bytes %u to %u, remaining bytes: %u", chunk_first_byte, chunk_last_byte, remainig_bytes);
+
+                        _client->flush();
+                        // Get the contents of the bin file
+                        _client->print(String("GET ") + _bin + " HTTP/1.1\r\n" +
+                                       "Host: " + _host + "\r\n" +
+                                       "Cache-Control: no-cache\r\n" +
+                                       "Range: bytes=" + String(chunk_first_byte) + "-" + String(chunk_last_byte) + "\r\n" +
+                                       "Connection: keep-alive\r\n\r\n");
+
+                        timeout = millis();
+                        while (_client->available() == 0)
+                        {
+                            if (millis() - timeout > CLIENT_TIMEOUT_MS)
+                            {
+                                ESP_LOGD(TAG, "No data from server for %d ms", CLIENT_TIMEOUT_MS);
+                                break;
+                            }
+                        }
+                        // At this point we should have data to read, if not, we will retry
+                        if(_client->available() == 0)
+                        {
+                            ESP_LOGD(TAG, "Closing connection and waiting 5s to reconnect");
+                            _client->stop();
+                            _blockingNetworkSemaphoreGive();
+                            delay(5000);
+                            continue;
+                        }
+
+                        // Read the headers
+                        while (_client->available())
+                        {
+                            String header, headerValue;
+                            // read line till /n
+                            String line = _client->readStringUntil('\n');
+
+                            // ESP_LOGV(TAG, "Header line: %s", line.c_str());
+
+                            // remove space, to check if the line is end of headers
+                            line.trim();
+
+                            if (!line.length())
+                            {
+                                ESP_LOGV(TAG, "Headers ended. Get the payload");
+                                break;
+                            }
+                            // Check if the HTTP Response is 206
+                            // else break and Exit Update
+                            if (line.startsWith("HTTP/1.1"))
+                            {
+                                if (line.indexOf("206") < 0)
+                                {
+                                    ESP_LOGE(TAG, "Got a non 206 status code from server. Exiting OTA Update.");
+                                    // @TODO: check exit code
+                                    _client->stop();
+                                    break;
+                                }
+                            }
+
+                            splitHeader(line, header, headerValue);
+
+                            // extract headers here
+                            // Connection
+                            if (header.equalsIgnoreCase("Connection"))
+                            {
+                                if (headerValue == "keep-alive")
+                                {
+                                    ESP_LOGD(TAG, "Server will keep the connection alive");
+                                    should_close_connection = false;
+                                }
+                                else
+                                {
+                                    ESP_LOGD(TAG, "Server will close the connection");
+                                    should_close_connection = true;
+                                }
+                            }
+                            // Content-Range
+                            else if (header.equalsIgnoreCase("Content-Range"))
+                            {
+                                ESP_LOGD(TAG, "Content-Range: %s", headerValue.c_str());
+                                // @TODO: check if the content range is valid
+                            }
+                        }
+
+                        uint bytes_to_read = chunk_last_byte - chunk_first_byte + 1;
+
+                        // Read the payload
+                        size_t readed_bytes = _client->readBytes(chunk_buffer, bytes_to_read);
+                        ESP_LOGD(TAG, "Readed %u bytes from payload", readed_bytes);
+
+                        // Check if the readed bytes are same as the expected bytes
+                        if (readed_bytes != bytes_to_read)
+                        {
+                            ESP_LOGE(TAG, "Expected %u bytes but got %u", bytes_to_read, readed_bytes);
+                            
+                            // We readed less than expected, so we update the chunk_last_byte acordingly
+                            chunk_last_byte = chunk_first_byte + readed_bytes - 1;
+                        }
+
+                        // Write chunk to flash
+                        last_written_bytes = Update.write(chunk_buffer, readed_bytes);
+                        total_written_bytes += last_written_bytes;
+
+                        // Check if the written bytes are same as the expected bytes
+                        if (last_written_bytes != readed_bytes)
+                        {
+                            ESP_LOGE(TAG, "Expected to write %u bytes but %u were written", readed_bytes, total_written_bytes);
+                        }else{
+                            ESP_LOGD(TAG, "Written %u bytes to flash", total_written_bytes);
+                        }
+
+                        chunk_first_byte += last_written_bytes;
+                        chunk_last_byte += last_written_bytes;
+                        remainig_bytes -= last_written_bytes;
+
+                        ESP_LOGD(TAG, "next chunk from bytes %u to %u, remaining bytes: %u", chunk_first_byte, chunk_last_byte, remainig_bytes);
+
+                        if (should_close_connection)
+                        {
+                            ESP_LOGD(TAG, "Server will close the connection, so we will stop the client to reconnect again later");
+                            _client->stop();
+                            delay(1000);
+                        }
+                        _blockingNetworkSemaphoreGive();
+                        delay(250); //give some time for other threads to take the semaphore
+                    }
+                }
+            }
+            else
+            {
+                ESP_LOGD(TAG, "OTA file will be downloaded in one go");
+                _blockingNetworkSemaphoreTake();
+                _client->flush();
+
+                // Connect to Webserver
+                if (_client->connect(_host.c_str(), _port))
+                {
+                    // Get the contents of the bin file
+                    _client->print(String("GET ") + _bin + " HTTP/1.1\r\n" +
+                                   "Host: " + _host + "\r\n" +
+                                   "Cache-Control: no-cache\r\n" +
+                                   "Connection: close\r\n\r\n");
+
+                    timeout = millis();
+                    while (_client->available() == 0)
+                    {
+                        if (millis() - timeout > CLIENT_TIMEOUT_MS)
+                        {
+                            ESP_LOGD(TAG, "Client Timeout !");
+                            _client->stop();
+                            _blockingNetworkSemaphoreGive();
+                            return false;
+                        }
+                    }
+                    while (_client->available())
+                    {
+                        String header, headerValue;
+                        // read line till /n
+                        String line = _client->readStringUntil('\n');
+
+                        ESP_LOGD(TAG, "Header line: %s", line.c_str());
+
+                        // remove space, to check if the line is end of headers
+                        line.trim();
+
+                        if (!line.length())
+                        {
+                            ESP_LOGD(TAG, "Headers ended. Get the OTA started");
+                            break;
+                        }
+                    }
+
+                    ESP_LOGD(TAG, "Begin OTA. This may take several minutes to complete. Patience!");
+                    total_written_bytes = Update.writeStream(*_client);
+                }
+                else
+                {
+                    ESP_LOGD(TAG, "Connection to %s failed!", _host.c_str());
+                    _blockingNetworkSemaphoreGive();
+                    return false;
+                }
+            }
+            _blockingNetworkSemaphoreGive();
+
+            if (total_written_bytes == contentLength)
+            {
+                ESP_LOGD(TAG, "Written: %d successfully", total_written_bytes);
+            }
+            else
+            {
+                ESP_LOGD(TAG, "Written only : %d of %d. OTA will not proceed. ", total_written_bytes, contentLength);
+            }
+
+            if (Update.end())
+            {
+                ESP_LOGD(TAG, "OTA done!");
+                if (Update.isFinished())
+                {
+                    ESP_LOGD(TAG, "Update MD5: %s", Update.md5String().c_str());
+                    ESP_LOGD(TAG, "Update successfully completed. Rebooting.");
+                    ESP.restart();
+                }
+                else
+                {
+                    ESP_LOGD(TAG, "Update not finished? Something went wrong!");
+                }
+            }
+            else
+            {
+                ESP_LOGD(TAG, "Error Occurred. Error #%d: %s", Update.getError(), Update.errorString());
+            }
+        }
+        else
+        {
+            // not enough space to begin OTA
+            // Understand the partitions and
+            // space availability
+            ESP_LOGE(TAG, "Not enough space to begin OTA");
+            _client->flush();
+
+            return false;
+        }
+    }
+    else
+    {
+        ESP_LOGE(TAG, "There was no content in the response or the content type was not application/octet-stream");
+        _client->flush();
+
+        return false;
+    }
+}
+
+bool esp32FOTAGSM::execHTTPcheck()
+{
+    int contentLength = 0;
+    bool isValidContentType = false;
+    bool gotHTTPStatus = false;
+
+    String useURL;
+
+    if (useDeviceID)
+    {
+        useURL = checkRESOURCE + "?id=" + _getDeviceID();
+    }
+    else
+    {
+        useURL = checkRESOURCE;
+    }
+
+    _port = 80;
+
+    ESP_LOGD(TAG, "Getting %s", useURL.c_str());
+
+    //current connection status should be checked before calling this function
+
+    _client->setTimeout(CLIENT_TIMEOUT_MS);
+
+    _blockingNetworkSemaphoreTake();
+    if (_client->connect(checkHOST.c_str(), checkPORT))
+    {
+        // Connection Succeed.
+
+        // Get the contents of the bin file
+        _client->print(String("GET ") + checkRESOURCE + " HTTP/1.1\r\n" +
+                       "Host: " + checkHOST + "\r\n" +
+                       "Cache-Control: no-cache\r\n" +
+                       "Connection: close\r\n\r\n");
+
+        unsigned long timeout = millis();
+        while (_client->available() == 0)
+        {
+            if (millis() - timeout > CLIENT_TIMEOUT_MS)
+            {
+                ESP_LOGD(TAG, "Client Timeout !");
+                _client->stop();
+                _blockingNetworkSemaphoreGive();
+                return false;
+            }
+        }
+
+        while (_client->available())
+        {
+            String header, headerValue;
+            // read line till /n
+            String line = _client->readStringUntil('\n');
+
+            ESP_LOGD(TAG, "Header line: %s", line.c_str());
+
+            // remove space, to check if the line is end of headers
+            line.trim();
+
+            if (!line.length())
+            {
+                //headers ended
+                break; // and get the OTA started
+            }
+
+            // Check if the HTTP Response is 200
+            // else break and Exit Update
+            if (line.startsWith("HTTP/1.1"))
+            {
+                if (line.indexOf("200") < 0)
+                {
+                    ESP_LOGD(TAG, "Got a non 200 status code from server. Exiting OTA Update.");
+                    _client->stop();
                     break;
                 }
                 gotHTTPStatus = true;
@@ -125,7 +599,7 @@ void esp32FOTAGSM::execOTA()
             if (header.equalsIgnoreCase("Content-Length"))
             {
                 contentLength = headerValue.toInt();
-                Serial.println("Got " + String(contentLength) + " bytes from server");
+                ESP_LOGD(TAG, "Content-Length: %d", contentLength);
                 continue;
             }
 
@@ -133,160 +607,39 @@ void esp32FOTAGSM::execOTA()
             if (header.equalsIgnoreCase("Content-type"))
             {
                 String contentType = headerValue;
-                Serial.println("Got " + contentType + " payload.");
-                if (contentType == "application/octet-stream")
+                ESP_LOGD(TAG, "Content-type: %s", contentType.c_str());
+                if (contentType == "application/json")
                 {
+                    ESP_LOGD(TAG, "Valid Content-type");
                     isValidContentType = true;
                 }
             }
         }
-    }
-    else
-    {
-        // Connect to webserver failed
-        // May be try?
-        // Probably a choppy network?
-        Serial.println("Connection to " + String(_host) + " failed. Please check your setup");
-        // retry??
-        // execOTA();
-    }
 
-    // Check what is the contentLength and if content type is `application/octet-stream`
-    Serial.println("contentLength : " + String(contentLength) + ", isValidContentType : " + String(isValidContentType));
-
-    // check contentLength and content type
-    if (contentLength && isValidContentType)
-    {
-        // Check if there is enough to OTA Update
-        bool canBegin = Update.begin(contentLength);
-
-        // If yes, begin
-        if (canBegin)
+        // check if the contectLength is bigger than the buffer size
+        if (contentLength > 256)
         {
-            Serial.println("Begin OTA. This may take 2 - 5 mins to complete. Things might be quite for a while.. Patience!");
-            // No activity would appear on the Serial monitor
-            // So be patient. This may take 2 - 5mins to complete
-            size_t written = Update.writeStream(client);
-
-            if (written == contentLength)
-            {
-                Serial.println("Written : " + String(written) + " successfully");
-            }
-            else
-            {
-                Serial.println("Written only : " + String(written) + "/" + String(contentLength) + ". Retry?");
-                // retry??
-                // execOTA();
-            }
-
-            if (Update.end())
-            {
-                Serial.println("OTA done!");
-                if (Update.isFinished())
-                {
-                    Serial.println("Update successfully completed. Rebooting.");
-                    ESP.restart();
-                }
-                else
-                {
-                    Serial.println("Update not finished? Something went wrong!");
-                }
-            }
-            else
-            {
-                Serial.println("Error Occurred. Error #: " + String(Update.getError()));
-            }
+            ESP_LOGD(TAG, "contentLength is bigger than 256 bytes. Exiting Update check.");
+            _client->stop();
+            _blockingNetworkSemaphoreGive();
+            return false;
         }
-        else
+
+        // check contentLength and content type
+        if (contentLength && isValidContentType)
         {
-            // not enough space to begin OTA
-            // Understand the partitions and
-            // space availability
-            Serial.println("Not enough space to begin OTA");
-            client.flush();
-        }
-    }
-    else
-    {
-        Serial.println("There was no content in the response");
-        client.flush();
-    }
-}
+            char JSONMessage[256];
+            _client->readBytes(JSONMessage, contentLength);
 
-bool esp32FOTAGSM::execHTTPcheck()
-{
-
-    String useURL;
-
-    if (useDeviceID)
-    {
-        // String deviceID = getDeviceID() ;
-        // useURL = checkURL + "?id=" + getDeviceID();
-		useURL = checkRESOURCE + "?id=" + getDeviceID(); // Kevin
-    }
-    else
-    {
-        // useURL = checkURL;
-		useURL = checkRESOURCE; // Kevin
-    }
-
-    _port = 80;
-
-    Serial.println("Getting HTTP");
-    Serial.println(useURL);
-    Serial.println("------");
-	
-	// CHANGE
-	// if ((WiFi.status() == WL_CONNECTED))
-	if (_modem->isGprsConnected())
-    { //Check the current connection status
-
-        // HTTPClient http;		   // TO CHANGE: Dont know if works
-
-        // http.begin(useURL);        //Specify the URL
-		// TinyGsmClient client((TinyGsm*)_modem);		// Kevin // Set o day bi bao loi. La thiet
-		TinyGsmClient client;
-		bool isClientOK = client.init(_modem);		// Kevin: return 1 => OK
-		// Serial.println("isClientOK: "+ String(isClientOK));
-		
-		// HttpClient    http(client, _host, _port); // Kevin
-		HttpClient    http(client, checkHOST, checkPORT); // Kevin
-        // int httpCode = http.GET(); //Make the request
-		// Serial.println("useURL: " + useURL);
-		// Serial.println("GPRS connected");
-				
-		int err = http.get(useURL);  // Kevin
-		// Serial.println("TinyGsmClient: " + String(client.connected()));
-		if (err != 0) {
-			Serial.println(F("failed to connect"));
-			delay(10000);
-			return false; // Error, nothing to update
-		}
-		else
-		{
-			// Hinh nhu cho nay ok
-			// Serial.println("http err:" + String(err));
-		}
-		
-		int httpCode = http.responseStatusCode();
-		// Serial.println("httpCode:" + String(httpCode));
-		
-        if (httpCode == 200)
-        { //Check is a file was returned
-
-            // String payload = http.getString(); // CHANGE 
-			String payload = http.responseBody();	// CHANGE
-
-            int str_len = payload.length() + 1;
-            char JSONMessage[str_len];
-            payload.toCharArray(JSONMessage, str_len);
+            _client->stop();
+            _blockingNetworkSemaphoreGive();
 
             StaticJsonDocument<300> JSONDocument; //Memory pool
             DeserializationError err = deserializeJson(JSONDocument, JSONMessage);
 
             if (err)
             { //Check for errors in parsing
-                Serial.println("Parsing failed");
+                ESP_LOGD(TAG, "Parsing failed");
                 delay(5000);
                 return false;
             }
@@ -299,11 +652,15 @@ bool esp32FOTAGSM::execHTTPcheck()
 
             String jshost(plhost);
             String jsbin(plbin);
+            String fwtype(pltype);
 
             _host = jshost;
             _bin = jsbin;
 
-            String fwtype(pltype);
+            ESP_LOGD(TAG, "Host: %s", plhost);
+            ESP_LOGD(TAG, "bin: %s", plbin);
+            ESP_LOGD(TAG, "type %s", pltype);
+
 
             if (plversion > _firwmareVersion && fwtype == _firwmareType)
             {
@@ -314,23 +671,28 @@ bool esp32FOTAGSM::execHTTPcheck()
                 return false;
             }
         }
-
         else
         {
-            // Serial.println("Error on HTTP request");
-			Serial.print("Error on HTTP request. Error code:");
-			Serial.println(httpCode);
+            ESP_LOGD(TAG, "There was no content in the response");
+            _client->flush();
+
+            _client->stop();
+            _blockingNetworkSemaphoreGive();
+
             return false;
         }
+    }
+    else
+    {
+        // Connect to webserver failed
+        ESP_LOGD(TAG, "Connection to %s failed.", checkHOST.c_str());
 
-        // http.end(); //Free the resources
-		http.stop();   // Kevin
+        _blockingNetworkSemaphoreGive();
         return false;
     }
-    return false;
 }
 
-String esp32FOTAGSM::getDeviceID()
+String esp32FOTAGSM::_getDeviceID()
 {
     char deviceid[21];
     uint64_t chipid;
@@ -349,7 +711,19 @@ void esp32FOTAGSM::forceUpdate(String firmwareHost, int firmwarePort, String fir
     execOTA();
 }
 
-void esp32FOTAGSM::setModem(TinyGsm& modem)
+void esp32FOTAGSM::setClient(Client &client)
 {
-	_modem = &modem;
+    this->_client = &client;
 }
+
+// set connection check function
+void esp32FOTAGSM::setConnectionCheckFunction(TConnectionCheckFunction connectionCheckFunction)
+{
+    this->_connectionCheckFunction = connectionCheckFunction;
+}
+
+void esp32FOTAGSM::setNetworkSemaphore(SemaphoreHandle_t networkSemaphore)
+{
+    this->_networkSemaphore = networkSemaphore;
+}
+

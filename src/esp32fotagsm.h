@@ -8,34 +8,50 @@
 #define esp32FOTAGSM_h
 
 #include "Arduino.h"
-
-#if (!defined(SRC_TINYGSMCLIENT_H_))
-#define TINY_GSM_MODEM_SIM800
-#include <TinyGsmClient.h>
-#endif  // SRC_TINYGSMCLIENT_H_
+#include <FreeRTOS.h>
+#include <functional>
 
 class esp32FOTAGSM
 {
 public:
-  esp32FOTAGSM(String firwmareType, int firwmareVersion);
+  typedef std::function<bool(void)> TConnectionCheckFunction;
+
+  esp32FOTAGSM(Client &client, String firwmareType, int firwmareVersion,
+               TConnectionCheckFunction connectionCheckFunction,
+               SemaphoreHandle_t networkSemaphore,
+               int ledPin = -1,
+               uint8_t ledOn = LOW,
+               bool chunkedDownload = false
+               );
+
   void forceUpdate(String firwmareHost, int firwmarePort, String firwmarePath);
-  void execOTA();
+  bool execOTA();
   bool execHTTPcheck();
   bool useDeviceID;
-  // String checkURL; 	// ArduinoHttpClient requires host, port and resource instead
-  String checkHOST; 	// example.com
-  int checkPORT;		// 80  
+  String checkHOST;     // example.com
+  int checkPORT;        // 80
   String checkRESOURCE; // /customer01/firmware.json
-  void setModem(TinyGsm& modem);
+  void setClient(Client &client);
+  void setConnectionCheckFunction(TConnectionCheckFunction connectionCheckFunction);
+  void setNetworkSemaphore(SemaphoreHandle_t networkSemaphore);
 
 private:
-  String getDeviceID();
+  bool _checkConnection();
+  void _blockingNetworkSemaphoreTake();
+  void _blockingNetworkSemaphoreGive();
+  String _getDeviceID();
+
   String _firwmareType;
   int _firwmareVersion;
   String _host;
   String _bin;
   int _port;
-  TinyGsm*	_modem;
+  Client *_client;
+  SemaphoreHandle_t _networkSemaphore;
+  TConnectionCheckFunction _connectionCheckFunction;
+  int _ledPin;
+  uint8_t _ledOn;
+  bool _chunkedDownload;
 };
 
 #endif
