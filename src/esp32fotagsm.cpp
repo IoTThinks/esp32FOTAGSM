@@ -93,6 +93,7 @@ bool esp32FOTAGSM::execOTA()
     _client->setTimeout(CLIENT_TIMEOUT_MS);
     ESP_LOGD(TAG, "timeout set to: %d", CLIENT_TIMEOUT_MS);
 
+    _blockingNetworkSemaphoreTake();
     // Connect to Webserver
     if (_client->connect(_host.c_str(), _port))
     {
@@ -114,6 +115,7 @@ bool esp32FOTAGSM::execOTA()
             {
                 ESP_LOGD(TAG, "Client Timeout !");
                 _client->stop();
+                _blockingNetworkSemaphoreGive();
                 return false;
             }
         }
@@ -189,11 +191,13 @@ bool esp32FOTAGSM::execOTA()
     else
     {
         ESP_LOGD(TAG, "Connection to %s failed!", _host.c_str());
+        _blockingNetworkSemaphoreGive();
         return false;
     }
 
     // We will open a new connection to the server later
     _client->stop();
+    _blockingNetworkSemaphoreGive();
 
     // check contentLength and content type
     if (contentLength && isValidContentType)
@@ -404,6 +408,7 @@ bool esp32FOTAGSM::execOTA()
             else
             {
                 ESP_LOGD(TAG, "OTA file will be downloaded in one go");
+                _blockingNetworkSemaphoreTake();
                 _client->flush();
 
                 // Connect to Webserver
@@ -422,6 +427,7 @@ bool esp32FOTAGSM::execOTA()
                         {
                             ESP_LOGD(TAG, "Client Timeout !");
                             _client->stop();
+                            _blockingNetworkSemaphoreGive();
                             return false;
                         }
                     }
@@ -449,9 +455,11 @@ bool esp32FOTAGSM::execOTA()
                 else
                 {
                     ESP_LOGD(TAG, "Connection to %s failed!", _host.c_str());
+                    _blockingNetworkSemaphoreGive();
                     return false;
                 }
             }
+            _blockingNetworkSemaphoreGive();
 
             if (total_written_bytes == contentLength)
             {
@@ -469,11 +477,6 @@ bool esp32FOTAGSM::execOTA()
                 {
                     ESP_LOGD(TAG, "Update MD5: %s", Update.md5String().c_str());
                     ESP_LOGD(TAG, "Update successfully completed. Rebooting.");
-                    while (1)
-                    {
-                        /* code */
-                    }
-                    
                     ESP.restart();
                 }
                 else
@@ -531,6 +534,7 @@ bool esp32FOTAGSM::execHTTPcheck()
 
     _client->setTimeout(CLIENT_TIMEOUT_MS);
 
+    _blockingNetworkSemaphoreTake();
     if (_client->connect(checkHOST.c_str(), checkPORT))
     {
         // Connection Succeed.
@@ -548,6 +552,7 @@ bool esp32FOTAGSM::execHTTPcheck()
             {
                 ESP_LOGD(TAG, "Client Timeout !");
                 _client->stop();
+                _blockingNetworkSemaphoreGive();
                 return false;
             }
         }
@@ -615,6 +620,8 @@ bool esp32FOTAGSM::execHTTPcheck()
         if (contentLength > 256)
         {
             ESP_LOGD(TAG, "contentLength is bigger than 256 bytes. Exiting Update check.");
+            _client->stop();
+            _blockingNetworkSemaphoreGive();
             return false;
         }
 
@@ -623,6 +630,9 @@ bool esp32FOTAGSM::execHTTPcheck()
         {
             char JSONMessage[256];
             _client->readBytes(JSONMessage, contentLength);
+
+            _client->stop();
+            _blockingNetworkSemaphoreGive();
 
             StaticJsonDocument<300> JSONDocument; //Memory pool
             DeserializationError err = deserializeJson(JSONDocument, JSONMessage);
@@ -651,6 +661,7 @@ bool esp32FOTAGSM::execHTTPcheck()
             ESP_LOGD(TAG, "bin: %s", plbin);
             ESP_LOGD(TAG, "type %s", pltype);
 
+
             if (plversion > _firwmareVersion && fwtype == _firwmareType)
             {
                 return true;
@@ -664,12 +675,19 @@ bool esp32FOTAGSM::execHTTPcheck()
         {
             ESP_LOGD(TAG, "There was no content in the response");
             _client->flush();
+
+            _client->stop();
+            _blockingNetworkSemaphoreGive();
+
+            return false;
         }
     }
     else
     {
         // Connect to webserver failed
         ESP_LOGD(TAG, "Connection to %s failed.", checkHOST.c_str());
+
+        _blockingNetworkSemaphoreGive();
         return false;
     }
 }
